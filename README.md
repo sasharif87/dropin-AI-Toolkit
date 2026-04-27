@@ -1,5 +1,7 @@
 # Drop-in AI Toolkit
 
+## About
+
 A powerful, modular AI toolkit designed to be dropped into any project. It auto-detects your project structure and uses local LLMs (via Ollama) to scaffold code, generate tests, perform code reviews, and automatically apply fixes.
 
 ## Features
