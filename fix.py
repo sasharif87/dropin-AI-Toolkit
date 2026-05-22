@@ -77,6 +77,15 @@ def _count_comment_lines(text):
                if ln.strip().startswith("#") or '"""' in ln or "'''" in ln)
 
 
+def _public_identifiers(source):
+    """Return the set of public top-level def/class names in Python source."""
+    return {
+        m.group(1)
+        for m in re.finditer(r"^(?:def|class)\s+([A-Za-z_]\w*)", source, re.MULTILINE)
+        if not m.group(1).startswith("_")
+    }
+
+
 def _syntax_check_py(content):
     """Compile-check Python content. Returns (ok, error_str)."""
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False,
@@ -167,6 +176,13 @@ def main():
                 print(f"SKIP ({err or 'empty'})")
                 continue
 
+            # Guard: file must fit within the model's context budget.
+            # Sending a truncated file would produce a partial fix that overwrites the original.
+            if len(original) > engine.content_budget("code"):
+                stats["skipped"] += 1
+                print(f"TOO_LARGE ({len(original):,} chars > budget {engine.content_budget('code'):,})")
+                continue
+
             prompt = FIX_PROMPT.format(issues=issues, filepath=rel, code=original)
             try:
                 fixed = engine.generate(prompt, role="code")
@@ -202,6 +218,17 @@ def main():
                 stats["errors"] += 1
                 print(f"COMMENT_STRIP ({fixed_comments}/{orig_comments} comment lines kept)")
                 continue
+
+            # Public API preservation — catch model hallucinating renamed functions/classes
+            if rel.endswith(".py"):
+                orig_ids = _public_identifiers(original)
+                fixed_ids = _public_identifiers(fixed)
+                missing = orig_ids - fixed_ids
+                if orig_ids and len(missing) / len(orig_ids) > 0.10:
+                    stats["errors"] += 1
+                    shown = ", ".join(sorted(missing)[:4])
+                    print(f"API_LOSS ({len(missing)} public names removed: {shown}{'...' if len(missing) > 4 else ''})")
+                    continue
 
             diff = list(difflib.unified_diff(
                 original.splitlines(keepends=True), fixed.splitlines(keepends=True),

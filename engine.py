@@ -18,44 +18,15 @@ import threading
 import urllib.request
 from datetime import datetime
 
+from catalog import preferences as _cat_prefs, ctx_windows as _cat_ctx
+
 # ---------------------------------------------------------------------------
 # Model role defaults — ordered by preference (first available wins)
+# Resolved from the active catalog so the data lives in catalog.py.
+# Module-level aliases keep all existing call sites working unchanged.
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Model role defaults — ordered by preference (first available wins)
-# ---------------------------------------------------------------------------
-MODEL_PREFERENCES = {
-    "reason": [
-        # Primary — largest available models for best consolidation quality
-        "qwen2.5:72b", "llama3.3:70b",
-        "deepseek-r1:32b", "qwen2.5:32b", "qwen3:32b",
-        "qwen2.5-coder:32b",
-        # Fallback — mid-range
-        "deepseek-r1:14b", "qwen2.5:14b", "qwen3:14b",
-        "mistral-small:latest", "gemma2:9b",
-        "deepseek-coder-v2:16b",
-    ],
-    "code": [
-        # Primary — qwen3-coder preferred (newer arch, ~30B); 2.5-coder:32b fallback
-        "qwen3-coder", "qwen2.5-coder:32b",
-        "qwen2.5:72b",
-        # Mid-range fallback
-        "qwen2.5-coder:14b", "qwen2.5-coder:7b",
-        "deepseek-coder-v2:16b",
-        "codellama:34b", "codellama:13b",
-        "llama3.1:8b",
-    ],
-    "quick": [
-        # Fast + code-aware
-        "qwen2.5-coder:7b",
-        "qwen2.5-coder:14b",
-        "qwen2.5:14b", "qwen2.5:7b",
-        "gemma2:9b", "llama3.2:3b",
-        "phi3:mini",
-        "deepseek-coder-v2:16b",
-        "mistral:7b-instruct",
-    ],
-}
+MODEL_PREFERENCES = _cat_prefs()
+MODEL_CTX_WINDOWS = _cat_ctx()
 
 # Context windows and temperature defaults per role
 CTX_DEFAULTS = {
@@ -68,6 +39,22 @@ TEMP_DEFAULTS = {
     "reason": 0.15,
     "code": 0.1,
     "quick": 0.05,
+}
+
+# ---------------------------------------------------------------------------
+# Context-window registry and chunking config
+# ---------------------------------------------------------------------------
+
+# Conservative chars-per-token ratio for mixed code/prose content.
+CHARS_PER_TOKEN = 3.0
+
+# Per-role KV-cache token caps.  Raise these if your GPU has VRAM to spare;
+# lower them if Ollama is OOM-ing.  ctx_for_role() uses these as a ceiling
+# even when the chosen model's architecture supports a larger window.
+ROLE_CTX_CAPS = {
+    "reason": 65_536,   # large enough for arch docs + consolidation
+    "code":   32_768,   # safe default for most desktop setups
+    "quick":   8_192,   # fast classification needs little context
 }
 
 
@@ -97,6 +84,8 @@ class Engine:
         self._available_code = None   # models on code_url
         self._resolved = {}           # role -> model name
         self._resolved_hosts = {}     # role -> host URL (tracks where the model actually lives)
+        self._probed_ctx = {}         # role -> context_length from /api/show (live probe)
+        self._hardware = None         # result of hardware.detect_gpu()
 
     # ── Connection & model discovery ─────────────────────────────────────────
 
@@ -113,7 +102,14 @@ class Engine:
         else:
             self._available_code = self._available
         if ok:
+            # Detect hardware before resolving so preference sorting can use it.
+            try:
+                from hardware import detect_gpu
+                self._hardware = detect_gpu()
+            except Exception:
+                self._hardware = None
             self._resolve_models()
+            self._probe_all_model_ctx()
         return ok, models, msg
 
     def _probe(self, url):
@@ -126,6 +122,56 @@ class Engine:
                 return True, models, f"Connected ({url}) — {len(models)} model(s)"
         except Exception as e:
             return False, [], f"Cannot reach {url}: {e}"
+
+    def _probe_model_ctx(self, model, host):
+        """Return the model's actual context_length via /api/show, or None on failure.
+
+        Ollama ≥0.1.33 exposes model_info with architecture-specific keys like
+        'llama.context_length' or 'qwen2.context_length'.  Older versions may
+        expose a num_ctx PARAMETER in the Modelfile parameters string instead.
+        """
+        try:
+            data = json.dumps({"model": model}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{host}/api/show",
+                data,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                info = json.loads(resp.read().decode("utf-8"))
+
+            # Preferred: model_info dict (Ollama ≥0.1.33)
+            for key, val in info.get("model_info", {}).items():
+                if "context_length" in key:
+                    return int(val)
+
+            # Fallback: PARAMETER num_ctx line in the Modelfile parameters blob
+            for line in info.get("parameters", "").splitlines():
+                parts = line.strip().lower().split()
+                if parts and parts[0] == "num_ctx" and len(parts) >= 2:
+                    return int(parts[-1])
+        except Exception:
+            pass
+        return None
+
+    def _probe_all_model_ctx(self):
+        """Call /api/show for every resolved model and cache context lengths.
+
+        Results take priority over MODEL_CTX_WINDOWS in ctx_for_role().
+        Duplicate model/host pairs are probed only once.
+        """
+        self._probed_ctx = {}
+        seen = {}  # (model, host) -> ctx
+        for role in ("reason", "code", "quick"):
+            model = self._resolved.get(role)
+            if not model:
+                continue
+            host = self._resolved_hosts.get(role, self.url)
+            key = (model, host)
+            if key not in seen:
+                seen[key] = self._probe_model_ctx(model, host)
+            if seen[key]:
+                self._probed_ctx[role] = seen[key]
 
     def _resolve_models(self):
         """Pick the best available model for each role.
@@ -175,8 +221,10 @@ class Engine:
                 pool = self._available or []
                 preferred_host = self.url
 
-            def _pick(search_pool):
-                for pref in MODEL_PREFERENCES[role]:
+            hw_prefs = self._hw_sorted_prefs(role)
+
+            def _pick(search_pool, prefs=hw_prefs):
+                for pref in prefs:
                     if pref in search_pool:
                         return pref
                     pref_base, pref_size = (pref.split(":", 1) + [""])[:2]
@@ -215,61 +263,207 @@ class Engine:
         """Print which model is assigned to which role and which host."""
         if not self._resolved:
             self._resolve_models()
+
+        hw = getattr(self, "_hardware", None)
+        if hw:
+            from hardware import print_hardware
+            print_hardware(hw)
+
+        try:
+            from hardware import model_size_gb as _msz
+        except ImportError:
+            _msz = lambda _: None  # noqa: E731
+
         print(f"\n  Model assignments:")
         for role in ("reason", "code", "quick"):
             model = self._resolved.get(role, "?")
             pinned = " (pinned)" if role in self.pinned else " (auto)"
             host = self._resolved_hosts.get(role, self.url)
-            print(f"    {role:<8} -> {model}{pinned}  [{host}]")
+            ctx = self.ctx_for_role(role)
+            budget = self.content_budget(role)
+
+            if self._probed_ctx.get(role):
+                ctx_src = "probed"
+            elif self._model_ctx(model):
+                ctx_src = "registry"
+            else:
+                ctx_src = "cap"
+
+            size = _msz(model)
+            if hw and size:
+                fits = "ok" if size <= hw["vram_gb"] * 0.90 else "!!"
+                size_tag = f"  [{fits} {size:.1f}GB]"
+            elif size:
+                size_tag = f"  [{size:.1f}GB]"
+            else:
+                size_tag = ""
+
+            print(f"    {role:<8} -> {model}{pinned}  [{host}]"
+                  f"  ctx={ctx//1024}k ({ctx_src})  budget≈{budget//1000}k chars{size_tag}")
         print()
+
+    # ── Hardware-aware preference sorting ────────────────────────────────────
+
+    def _hw_sorted_prefs(self, role):
+        """Return MODEL_PREFERENCES[role] with hardware-fitting models first.
+
+        Models whose catalogued VRAM requirement exceeds the detected budget are
+        demoted to the end of the list.  Models not in the size catalog are left
+        in place (we cannot safely exclude them).  When no hardware info is
+        available the original preference order is returned unchanged.
+        """
+        hw = getattr(self, "_hardware", None)
+        if not hw:
+            return MODEL_PREFERENCES[role]
+        try:
+            from hardware import model_size_gb
+        except ImportError:
+            return MODEL_PREFERENCES[role]
+
+        budget = hw["vram_gb"] * 0.90
+        prefs = MODEL_PREFERENCES[role]
+        fitting = [m for m in prefs
+                   if (sz := model_size_gb(m)) is None or sz <= budget]
+        non_fitting = [m for m in prefs if m not in set(fitting)]
+        return fitting + non_fitting
+
+    # ── Context-window helpers ────────────────────────────────────────────────
+
+    def _model_ctx(self, model):
+        """Context window (tokens) from registry; None if unknown."""
+        if model in MODEL_CTX_WINDOWS:
+            return MODEL_CTX_WINDOWS[model]
+        base = model.split(":")[0]
+        for key, ctx in MODEL_CTX_WINDOWS.items():
+            if key.split(":")[0] == base:
+                return ctx
+        return None
+
+    def ctx_for_role(self, role):
+        """Token budget to request from Ollama for this role's model.
+
+        Priority order:
+          1. Live /api/show probe  — most accurate, reflects actual model weights
+          2. MODEL_CTX_WINDOWS     — static registry for known model families
+          3. ROLE_CTX_CAPS fallback
+
+        Always capped by ROLE_CTX_CAPS to avoid giant KV-cache allocations on
+        modest hardware.  Adjust ROLE_CTX_CAPS at the top of this file if you
+        have more VRAM and want larger effective windows.
+        """
+        cap = ROLE_CTX_CAPS.get(role, CTX_DEFAULTS.get(role, 32_768))
+        probed = self._probed_ctx.get(role)
+        if probed:
+            return min(probed, cap)
+        known = self._model_ctx(self.model_for(role))
+        return min(known, cap) if known else cap
+
+    def content_budget(self, role):
+        """Max characters for source content in a single prompt for this role.
+
+        Reserves ~28 % of the context for prompt scaffolding and the response.
+        Text larger than this should be chunked before being sent to the model.
+        """
+        return int(self.ctx_for_role(role) * CHARS_PER_TOKEN * 0.72)
 
     # ── Generation ───────────────────────────────────────────────────────────
 
     def generate(self, prompt, *, role="code", temperature=None, num_ctx=None,
-                 timeout=1800):
-        """Send prompt to Ollama. Model + host selected by role."""
+                 timeout=1800, retries=1):
+        """Send prompt to Ollama. Model + host selected by role.
+
+        Retries once at temperature=0 on empty responses or transient network
+        errors.  Pass retries=0 to disable.
+        """
         model = self.model_for(role)
         host = self._resolved_hosts.get(role, self.code_url if role == "code" else self.url)
-        data = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": temperature if temperature is not None else TEMP_DEFAULTS.get(role, 0.1),
-                "num_ctx": num_ctx or CTX_DEFAULTS.get(role, 16384),
-            },
-        }
-        req = urllib.request.Request(
-            f"{host}/api/generate",
-            json.dumps(data).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            return result.get("response", "").strip()
+        last_exc = None
+
+        for attempt in range(1 + retries):
+            # Force temperature=0 on retry so the model doesn't hallucinate again.
+            if attempt > 0 and temperature is None:
+                eff_temp = 0.0
+            else:
+                eff_temp = temperature if temperature is not None else TEMP_DEFAULTS.get(role, 0.1)
+
+            data = {
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": eff_temp,
+                    "num_ctx": num_ctx if num_ctx is not None else self.ctx_for_role(role),
+                },
+            }
+            req = urllib.request.Request(
+                f"{host}/api/generate",
+                json.dumps(data).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                    response = result.get("response", "").strip()
+                    if response:
+                        return response
+                    if attempt < retries:
+                        log(f"  [retry {attempt + 1}/{retries}] empty response — retrying at temp=0")
+            except Exception as e:
+                last_exc = e
+                if attempt < retries:
+                    log(f"  [retry {attempt + 1}/{retries}] {e} — retrying")
+                else:
+                    raise
+
+        if last_exc:
+            raise last_exc
+        return ""
 
     def chat(self, messages, *, role="code", temperature=None, num_ctx=None,
-             timeout=1800):
+             timeout=1800, retries=1):
         """Send chat messages to Ollama. Model selected by role."""
         model = self.model_for(role)
-        data = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "options": {
-                "temperature": temperature if temperature is not None else TEMP_DEFAULTS.get(role, 0.1),
-                "num_ctx": num_ctx or CTX_DEFAULTS.get(role, 16384),
-            },
-        }
         host = self._resolved_hosts.get(role, self.code_url if role == "code" else self.url)
-        req = urllib.request.Request(
-            f"{host}/api/chat",
-            json.dumps(data).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            return result.get("message", {}).get("content", "").strip()
+        last_exc = None
+
+        for attempt in range(1 + retries):
+            if attempt > 0 and temperature is None:
+                eff_temp = 0.0
+            else:
+                eff_temp = temperature if temperature is not None else TEMP_DEFAULTS.get(role, 0.1)
+
+            data = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "temperature": eff_temp,
+                    "num_ctx": num_ctx if num_ctx is not None else self.ctx_for_role(role),
+                },
+            }
+            req = urllib.request.Request(
+                f"{host}/api/chat",
+                json.dumps(data).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                    response = result.get("message", {}).get("content", "").strip()
+                    if response:
+                        return response
+                    if attempt < retries:
+                        log(f"  [retry {attempt + 1}/{retries}] empty response — retrying at temp=0")
+            except Exception as e:
+                last_exc = e
+                if attempt < retries:
+                    log(f"  [retry {attempt + 1}/{retries}] {e} — retrying")
+                else:
+                    raise
+
+        if last_exc:
+            raise last_exc
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -299,17 +493,47 @@ def extract_json(text):
     return None
 
 
-def read_file(path, max_chars=80_000):
-    """Read file, return (content, error)."""
+def read_file(path, max_chars=500_000):
+    """Read file, return (content, error).
+
+    Default limit raised to 500 k so callers can chunk rather than skip large
+    files.  Pass a smaller max_chars to keep the old reject-early behaviour.
+    """
     try:
         if os.path.getsize(path) > max_chars:
-            return None, f"too large ({os.path.getsize(path):,} chars)"
+            return None, f"too large ({os.path.getsize(path):,} bytes)"
         with open(path, "r", encoding="utf-8") as f:
             return f.read(), None
     except UnicodeDecodeError:
         return None, "binary"
     except Exception as e:
         return None, str(e)
+
+
+def chunk_text(text, max_chars, overlap=300):
+    """Split *text* into overlapping chunks that each fit in *max_chars*.
+
+    Breaks preferentially at newline boundaries in the second half of each
+    window, so we never cut mid-line.  Consecutive chunks share *overlap*
+    characters so that code near the seam is fully visible in at least one
+    chunk.  Returns a list with one element when text already fits.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end < len(text):
+            # Find the last newline in the second half of the window.
+            nl = text.rfind("\n", start + max_chars // 2, end)
+            if nl != -1:
+                end = nl + 1
+        chunks.append(text[start:end])
+        # Overlap: next chunk re-reads the last `overlap` chars.
+        start = max(end - overlap, start + 1)  # +1 guarantees progress
+    return chunks
 
 
 def fmt_time(seconds):

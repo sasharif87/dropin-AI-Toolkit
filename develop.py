@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
@@ -116,7 +117,7 @@ File: {file_path}
 Purpose: {purpose}
 Key classes/functions: {key_items}
 Dependencies: {dependencies}
-
+{dep_signatures}
 Data models (if relevant):
 {models_json}
 
@@ -165,6 +166,21 @@ def _ensure_section_headers(code: str, file_path: str) -> str:
     return "\n".join(lines)
 
 
+def _safe_abs_path(root, rel):
+    """Return a normalised absolute path only if rel stays inside root.
+
+    Rejects absolute paths and directory-traversal sequences.
+    Returns None when the path would escape the project root.
+    """
+    # Strip leading separators that trick os.path.join into treating rel as absolute.
+    rel = rel.lstrip("/\\").replace("\\", "/")
+    abs_p = os.path.normpath(os.path.join(root, rel))
+    root_norm = os.path.normpath(root)
+    if abs_p != root_norm and not abs_p.startswith(root_norm + os.sep):
+        return None
+    return abs_p
+
+
 # ---------------------------------------------------------------------------
 # Developer
 # ---------------------------------------------------------------------------
@@ -176,6 +192,46 @@ class Developer:
         self.plan = None
         self.generated = {}  # path → content
         self.errors = []
+
+    # ── Validation helpers ────────────────────────────────────────────────────
+
+    def _validate_plan(self, plan):
+        """Return True if plan has the minimum required structure."""
+        if not isinstance(plan, dict):
+            log("  Plan is not a dict")
+            return False
+        layers = plan.get("layers")
+        if not isinstance(layers, list) or not layers:
+            log("  Plan has no layers list")
+            return False
+        for layer in layers:
+            if not isinstance(layer, dict):
+                log("  Layer entry is not a dict — skipping")
+                continue
+            for fspec in layer.get("files", []):
+                if not isinstance(fspec, dict) or not fspec.get("path"):
+                    log("  File spec missing 'path' — will skip")
+        return True
+
+    def _dep_signatures(self, dep_paths):
+        """Return a compact signature listing for already-generated dependencies.
+
+        Lets the model see the real public interface of files it depends on
+        instead of hallucinating function names from the spec alone.
+        """
+        lines = []
+        for dep in dep_paths:
+            code = self.generated.get(dep)
+            if not code:
+                continue
+            sigs = re.findall(r"^(?:def|class)\s+([A-Za-z_]\w*[^:]*)", code, re.MULTILINE)
+            public = [s.strip() for s in sigs if not s.strip().startswith("_")]
+            if public:
+                lines.append(f"  # {dep}")
+                lines.extend(f"  {s}" for s in public)
+        if not lines:
+            return ""
+        return "Already-generated dependency signatures (use these exact names):\n" + "\n".join(lines) + "\n"
 
     def run(self, apply=False, layer_filter=None, plan_only=False):
         start = time.time()
@@ -224,7 +280,7 @@ class Developer:
             return None
 
         arch_path = os.path.join(self.info["root"], arch_doc_rel)
-        content, err = read_file(arch_path, max_chars=50_000)
+        content, err = read_file(arch_path)
         if err:
             log(f"Cannot read {arch_path}: {err}")
             return None
@@ -235,9 +291,9 @@ class Developer:
         reason_model = self.engine.model_for("reason")
         code_model = self.engine.model_for("code")
         role = "reason" if reason_model != code_model else "code"
-        ctx = 16384 if role == "reason" else 8192
+        budget = self.engine.content_budget(role)
 
-        log(f"  Arch doc: {arch_doc_rel} ({len(content):,} chars)")
+        log(f"  Arch doc: {arch_doc_rel} ({len(content):,} chars, budget={budget//1000}k)")
         log(f"  Sending to {role} model ({self.engine.model_for(role)})...")
 
         detected = json.dumps({
@@ -248,15 +304,18 @@ class Developer:
         }, indent=2)
 
         prompt = ANALYZE_ARCH_PROMPT.format(
-            arch_doc=content[:10_000],  # cap arch doc — model doesn't need the full text to plan
+            arch_doc=content[:budget],
             detected_structure=detected,
         )
 
         t0 = time.time()
         try:
-            response = self.engine.generate(prompt, role=role, num_ctx=ctx, timeout=1800)
+            response = self.engine.generate(prompt, role=role, timeout=1800)
             plan = extract_json(response)
             log(f"  Plan extracted in {fmt_time(time.time() - t0)}")
+            if not plan or not self._validate_plan(plan):
+                log("  Plan failed validation — cannot proceed")
+                return None
             return plan
         except Exception as e:
             log(f"  ERROR: {e}")
@@ -314,12 +373,24 @@ class Developer:
 
             for fspec in files:
                 counter += 1
-                fpath = fspec.get("path", "unknown")
+                raw_path = fspec.get("path", "") if isinstance(fspec, dict) else ""
+                if not raw_path:
+                    self.errors.append(("?", "fspec missing path"))
+                    continue
+
+                # Reject paths that try to escape the project root.
+                fpath = raw_path.lstrip("/\\").replace("\\", "/")
+                if ".." in fpath.split("/"):
+                    self.errors.append((raw_path, "path traversal rejected"))
+                    print(f"    [{counter}/{total}] SKIP (traversal): {raw_path}")
+                    continue
+
                 purpose = fspec.get("purpose", "")
                 key_items = ", ".join(
                     fspec.get("key_classes", []) + fspec.get("key_functions", [])
                 )
-                deps = ", ".join(fspec.get("depends_on", []))
+                dep_paths = fspec.get("depends_on", [])
+                deps = ", ".join(dep_paths)
 
                 # Related models/routes
                 related_models = [m for m in self.plan.get("data_models", [])
@@ -339,6 +410,7 @@ class Developer:
                     purpose=purpose,
                     key_items=key_items or "(determine from purpose)",
                     dependencies=deps or "(none specified)",
+                    dep_signatures=self._dep_signatures(dep_paths),
                     models_json=json.dumps(related_models, indent=2)[:3000] if related_models else "n/a",
                     routes_json=json.dumps(related_routes, indent=2)[:3000] if related_routes else "n/a",
                 )
@@ -412,10 +484,14 @@ class Developer:
 
     def _write_files(self):
         root = self.info["root"]
-        written = skipped = 0
+        written = skipped = blocked = 0
 
         for rel_path, content in sorted(self.generated.items()):
-            abs_path = os.path.join(root, rel_path)
+            abs_path = _safe_abs_path(root, rel_path)
+            if abs_path is None:
+                blocked += 1
+                print(f"    BLOCKED (unsafe path): {rel_path}")
+                continue
             if os.path.isfile(abs_path):
                 print(f"    SKIP (exists): {rel_path}")
                 skipped += 1
@@ -427,7 +503,7 @@ class Developer:
             print(f"    WROTE: {rel_path}")
             written += 1
 
-        log(f"\n  Written: {written} | Skipped (existing): {skipped}")
+        log(f"\n  Written: {written} | Skipped (existing): {skipped} | Blocked (unsafe): {blocked}")
 
     def _preview(self):
         root = self.info["root"]
@@ -436,11 +512,17 @@ class Developer:
 
         log(f"\n  Files that would be created ({len(self.generated)}):\n")
         for path, content in sorted(self.generated.items()):
+            abs_path = _safe_abs_path(root, path)
+            if abs_path is None:
+                print(f"    BLOCKED (unsafe path): {path}")
+                continue
             lines = content.count("\n") + 1
-            exists = " (EXISTS)" if os.path.isfile(os.path.join(root, path)) else ""
+            exists = " (EXISTS)" if os.path.isfile(abs_path) else ""
             print(f"    {path:<55} {lines:>4} lines{exists}")
 
-            preview_path = os.path.join(preview_dir, path.replace("/", os.sep))
+            preview_path = _safe_abs_path(preview_dir, path)
+            if preview_path is None:
+                continue
             os.makedirs(os.path.dirname(preview_path), exist_ok=True)
             with open(preview_path, "w", encoding="utf-8") as f:
                 f.write(content)

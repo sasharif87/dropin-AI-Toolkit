@@ -141,14 +141,15 @@ class TestGenerator:
 
             prompt = ANALYZE_PROMPT.format(
                 lang=self.lang, filepath=rel, layer_name=lname,
-                rules_summary=rules_summary, code=code[:10_000],
+                rules_summary=rules_summary,
+                code=code[:self.engine.content_budget("quick")],
             )
 
             # If quick resolved to the same model as code, use code role to avoid
             # double-booking the same model and stalling Ollama.
             quick_role = "quick" if self.engine.model_for("quick") != self.engine.model_for("code") else "code"
             try:
-                resp = self.engine.generate(prompt, role=quick_role, num_ctx=8192, timeout=1800)
+                resp = self.engine.generate(prompt, role=quick_role, timeout=1800)
                 plan = extract_json(resp)
                 if plan and plan.get("testable"):
                     self.plans[rel] = plan
@@ -187,7 +188,7 @@ class TestGenerator:
                 test_framework=self.framework,
                 project_name=self.info["name"], layer_name=lname,
                 rules=rules[:2000], test_plan=json.dumps(plan, indent=2),
-                filepath=rel, code=code[:20_000],
+                filepath=rel, code=code[:self.engine.content_budget("code")],
             )
 
             try:

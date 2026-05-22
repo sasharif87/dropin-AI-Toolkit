@@ -19,7 +19,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 
-from engine import Engine, read_file, fmt_time, log
+from engine import Engine, read_file, chunk_text, fmt_time, log
 from detect import detect, print_detection
 from rules import build_all_rules, load_rules, save_rules
 
@@ -218,11 +218,61 @@ class Reviewer:
         log(f"\n  Total: {fmt_time(time.time() - start)}")
 
     def _review_file(self, rel, code, rules):
+        """Review *code*, chunking automatically when it exceeds the model's budget."""
+        budget = self.engine.content_budget("code")
+        total_lines = code.count("\n") + 1
+
+        if len(code) <= budget:
+            return self._do_review(rel, code, rules, full_source=code,
+                                   line_start=1, total_lines=total_lines)
+
+        # File is too large for one context window — review in overlapping chunks.
+        chunks = chunk_text(code, budget, overlap=300)
+        log(f"    (large file — {len(chunks)} chunks of ~{budget//1000}k chars each)")
+
+        all_bodies = []
+        total_dropped = 0
+        char_pos = 0
+
+        for idx, chunk in enumerate(chunks, 1):
+            line_start = code[:char_pos].count("\n") + 1
+            chunk_label = f"{rel} [part {idx}/{len(chunks)}]"
+            result, dropped = self._do_review(chunk_label, chunk, rules, full_source=code,
+                                              line_start=line_start, total_lines=total_lines)
+            total_dropped += dropped
+            if result:
+                # Strip the per-chunk "## `...`" header; we'll add one combined header.
+                body = re.sub(r"^## `[^`\n]+`\n\n", "", result).strip()
+                all_bodies.append(f"*Part {idx}/{len(chunks)} (file lines {line_start}–"
+                                  f"{line_start + chunk.count(chr(10))}):*\n\n{body}")
+            # Advance past this chunk; overlap means next chunk re-reads last 300 chars.
+            char_pos = max(char_pos + len(chunk) - 300, char_pos + 1)
+
+        if not all_bodies:
+            return None, total_dropped
+
+        merged = f"## `{rel}` *(reviewed in {len(chunks)} chunks)*\n\n"
+        merged += "\n\n---\n\n".join(all_bodies) + "\n\n"
+        return merged, total_dropped
+
+    def _do_review(self, rel, code, rules, full_source, line_start=1, total_lines=None):
+        """Send one code block to the model and return grounded findings."""
+        # When reviewing a chunk, tell the model which part of the file it sees
+        # so line numbers in findings are anchored to the full file.
+        if total_lines and line_start > 1:
+            line_end = line_start + code.count("\n")
+            chunk_header = (f"# [Reviewing lines {line_start}–{line_end} of {total_lines}."
+                            f" Report line numbers relative to the FULL file (add {line_start - 1}"
+                            f" to any line number you see here).]\n")
+            code_for_prompt = chunk_header + code
+        else:
+            code_for_prompt = code
+
         prompt = REVIEW_PROMPT.format(
             project_name=self.info["name"],
             rules=rules or "(no layer rules)",
             filepath=rel,
-            code=code[:30_000],
+            code=code_for_prompt,
         )
 
         try:
@@ -238,7 +288,8 @@ class Reviewer:
         if bullets == 0 and len(lines) > 5:
             return None, 0
 
-        grounded, kept, dropped = ground_findings(reply, code)
+        # Ground against the full source so quotes near chunk seams can be verified.
+        grounded, kept, dropped = ground_findings(reply, full_source)
         if dropped:
             grounded = grounded.rstrip() + f"\n\n> *Grounding dropped {dropped} unverifiable finding(s).*\n"
         grounded = grounded.strip()
@@ -250,14 +301,15 @@ class Reviewer:
     def _consolidate(self, layer_content, output_path, ts):
         entries = [(k, v) for k, v in layer_content.items() if v]
         layer_reviews = {}
+        budget = self.engine.content_budget("reason")
 
         for i, (lk, findings) in enumerate(entries, 1):
             lname = self.info["layers"].get(lk, {}).get("name", lk)
-            text = "\n\n---\n\n".join(findings)[:12_000]
+            text = "\n\n---\n\n".join(findings)[:budget]
             print(f"    [{i}/{len(entries)}] {lname}...", end=" ", flush=True)
             try:
                 prompt = CONSOLIDATION_PROMPT.format(findings=text)
-                result = self.engine.generate(prompt, role="reason", num_ctx=8192)
+                result = self.engine.generate(prompt, role="reason")
                 layer_reviews[lk] = result or f"### {lname}\nNo output."
                 print("done")
             except Exception as e:

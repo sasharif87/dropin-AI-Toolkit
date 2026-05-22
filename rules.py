@@ -347,8 +347,11 @@ def generate_rules_from_architecture(engine, arch_doc_path, layers, stack, patte
                            f"{', '.join(lines[:3])}...")
     pattern_summary = "\n".join(summary_lines)
 
+    budget = engine.content_budget("reason")
+    if len(content) > budget:
+        print(f"  Arch doc truncated for rules prompt ({len(content):,} → {budget:,} chars)")
     prompt = ARCH_RULES_PROMPT.format(
-        arch_doc=content[:15_000],  # truncate if huge
+        arch_doc=content[:budget],
         structure=structure,
         pattern_rules_summary=pattern_summary,
     )

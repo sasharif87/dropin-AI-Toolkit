@@ -35,7 +35,6 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
 
 # Ensure the script directory is on the path so imports work
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,11 +44,151 @@ if SCRIPT_DIR not in sys.path:
 from engine import Engine, fmt_time, log, timed_input
 from detect import detect, print_detection
 from rules import build_all_rules, save_rules, load_rules
+import catalog
+import config
 
 
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
+def cmd_setup(args, engine, info, rules):
+    """Interactive 4-step setup wizard: connection, hardware, catalog, model install."""
+    import hardware as hw_mod
+
+    cfg = config.load()
+
+    # ── Step 1 — Ollama connection ────────────────────────────────────────────
+    print("\n  ── Step 1: Ollama connection ──")
+    current_url = cfg.get("url", "http://localhost:11434")
+    print(f"  Current URL: {current_url}")
+    try:
+        new_url = input(f"  Ollama URL [{current_url}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        new_url = ""
+    if new_url and new_url != current_url:
+        cfg["url"] = new_url
+        args.url = new_url
+        # Re-test with new URL
+        ok, _, msg = engine._probe(new_url)
+        print(f"  Connection: {msg}")
+    else:
+        print(f"  Connection: using {current_url}")
+
+    current_code_url = cfg.get("code_url") or ""
+    print(f"  Current code-model URL: {current_code_url or '(same as primary)'}")
+    try:
+        new_code_url = input(
+            f"  Separate code-model host? [{current_code_url or 'leave blank to skip'}]: "
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        new_code_url = ""
+    if new_code_url:
+        cfg["code_url"] = new_code_url
+    elif not current_code_url:
+        cfg["code_url"] = None
+
+    # ── Step 2 — Hardware ────────────────────────────────────────────────────
+    print("\n  ── Step 2: Hardware ──")
+    hardware = getattr(engine, "_hardware", None) or hw_mod.detect_gpu()
+    # Hardware summary was already printed by print_model_map() in main(); nothing extra needed.
+    vram = hardware["vram_gb"]
+    print(f"  VRAM budget: {vram:.1f} GB")
+
+    # ── Step 3 — Model catalog ───────────────────────────────────────────────
+    print("\n  ── Step 3: Model catalog ──")
+    cat_ver = catalog.catalog_version()
+    # Determine source of currently active catalog
+    import catalog as _cat_mod
+    if _cat_mod._catalog is not None and _cat_mod._catalog is not _cat_mod.BUILTIN_CATALOG:
+        cat_source = "cached"
+    else:
+        import os as _os
+        cat_source = "cached" if _os.path.isfile(_cat_mod.CATALOG_CACHE) else "builtin"
+    print(f"  Catalog version: {cat_ver}  (source: {cat_source})")
+
+    configured_cat_url = cfg.get("catalog_url", "")
+    if configured_cat_url:
+        try:
+            answer = input(
+                f"  Refresh catalog from {configured_cat_url}? [y/N]: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer == "y":
+            try:
+                new_cat = catalog.fetch(configured_cat_url)
+                _cat_mod._catalog = new_cat   # update module-level cache
+                print(f"  Catalog updated — version: {new_cat.get('version', 'unknown')}")
+            except ValueError as e:
+                print(f"  Catalog fetch failed: {e}")
+    else:
+        try:
+            new_cat_url = input(
+                "  Enter catalog URL to enable updates (leave blank to skip): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            new_cat_url = ""
+        if new_cat_url:
+            try:
+                new_cat = catalog.fetch(new_cat_url)
+                _cat_mod._catalog = new_cat
+                cfg["catalog_url"] = new_cat_url
+                print(f"  Catalog fetched — version: {new_cat.get('version', 'unknown')}")
+            except ValueError as e:
+                print(f"  Catalog fetch failed: {e}")
+
+    # ── Step 4 — Model installation ──────────────────────────────────────────
+    print("\n  ── Step 4: Model installation ──")
+    current = hw_mod.installed_models(args.url)
+    installed_names = {m["name"] for m in current}
+
+    rec = hw_mod.recommend_models(vram, installed_names, catalog.preferences())
+    hw_mod.print_recommendation_table(rec, current)
+
+    to_pull = [role_info["model"] for role_info in rec.values() if not role_info["installed"]]
+    to_update = [role_info["model"] for role_info in rec.values() if role_info["installed"]]
+
+    if not to_pull and not getattr(args, "update", False):
+        log("\n  All recommended models are already installed.")
+        log("  Run with --update to re-pull and check for newer versions.")
+    else:
+        if to_pull:
+            total_gb = sum(hw_mod.model_size_gb(m) or 0 for m in to_pull)
+            print(f"\n  Models to download ({len(to_pull)}):  ~{total_gb:.1f} GB total")
+            for m in to_pull:
+                sz = hw_mod.model_size_gb(m)
+                print(f"    {m:<35} {'~' + str(sz) + ' GB' if sz else '?'}")
+
+        if getattr(args, "update", False) and to_update:
+            print(f"\n  Models to update ({len(to_update)}):")
+            for m in to_update:
+                print(f"    {m}")
+
+        targets = to_pull + (to_update if getattr(args, "update", False) else [])
+        if targets:
+            try:
+                answer = input(f"\n  Pull {len(targets)} model(s) now? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+
+            if answer != "y":
+                log("  Skipped — re-run without changes when ready.")
+            else:
+                ok_count = fail_count = 0
+                for model in targets:
+                    if hw_mod.pull_model(model, args.url):
+                        ok_count += 1
+                    else:
+                        fail_count += 1
+                log(f"\n  Done — {ok_count} pulled, {fail_count} failed.")
+                if ok_count:
+                    log("  Re-run any drop.py command to use the updated models.")
+
+    # ── Save config ──────────────────────────────────────────────────────────
+    saved_path = config.save(cfg)
+    print(f"\n  Config saved to {saved_path}")
+
+
 def cmd_detect(args, engine, info, rules):
     """Just detect and show what we found."""
     print_detection(info)
@@ -338,15 +477,40 @@ def main():
     parser.add_argument("--integration", action="store_true", help="[test] Include integration tests")
     parser.add_argument("--skip-consolidation", action="store_true", help="[review] Skip pass 2")
     parser.add_argument("--skip-tests", action="store_true", help="[all] Skip test run phases")
+    parser.add_argument("--update", action="store_true",
+                        help="[setup] Re-pull already-installed models to check for updates")
 
     parser.add_argument("command", nargs="?", default="detect",
-                        choices=["detect", "develop", "test", "review", "fix", "all", "full"],
+                        choices=["detect", "develop", "test", "review", "fix", "all", "full",
+                                 "setup", "install"],
                         help="What to do (default: detect)")
 
     args = parser.parse_args()
 
+    # ── Load config (CLI args override config file values) ──
+    cfg = config.load()
+
+    # Apply config defaults where CLI args were not explicitly set.
+    # argparse defaults are indistinguishable from user-supplied values, so we
+    # check against the parser defaults and only substitute config values when
+    # the user left the arg at its default.
+    _parser_defaults = {
+        "url": "http://localhost:11434",
+        "code_url": "http://localhost:11434",
+    }
+    if args.url == _parser_defaults["url"] and cfg.get("url"):
+        args.url = cfg["url"]
+    if args.code_url == _parser_defaults["code_url"] and cfg.get("code_url"):
+        args.code_url = cfg["code_url"]
+
+    # Apply catalog URL from config if set
+    if cfg.get("catalog_url"):
+        import catalog as _cat_mod
+        _cat_mod.CATALOG_URL = cfg["catalog_url"]
+
     # ── Setup engine ──
-    models = {}
+    # Start from config-defined model pins, then let explicit CLI flags override.
+    models = dict(cfg.get("models", {}))
     if args.reason_model: models["reason"] = args.reason_model
     if args.code_model: models["code"] = args.code_model
     if args.quick_model: models["quick"] = args.quick_model
@@ -364,6 +528,11 @@ def main():
         print(f"  Make sure it's running: ollama serve")
         sys.exit(1)
     engine.print_model_map()
+
+    # setup/install only need Ollama connectivity — skip project detection and rules.
+    if args.command in ("setup", "install"):
+        cmd_setup(args, engine, info=None, rules=None)
+        return
 
     # ── Detect project ──
     project_root = os.path.abspath(args.project)
@@ -383,13 +552,13 @@ def main():
 
     # ── Dispatch ──
     commands = {
-        "detect": cmd_detect,
+        "detect":  cmd_detect,
         "develop": cmd_develop,
-        "test": cmd_test,
-        "review": cmd_review,
-        "fix": cmd_fix,
-        "all": cmd_all,
-        "full": cmd_full,
+        "test":    cmd_test,
+        "review":  cmd_review,
+        "fix":     cmd_fix,
+        "all":     cmd_all,
+        "full":    cmd_full,
     }
 
     handler = commands.get(args.command, cmd_detect)

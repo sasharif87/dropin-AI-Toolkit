@@ -1,0 +1,10 @@
+{
+  "recommendations": [
+    "ms-python.python",
+    "ms-python.pylance",
+    "ms-python.debugpy",
+    "charliermarsh.ruff",
+    "mikestead.dotenv",
+    "eamodio.gitlens"
+  ]
+}
