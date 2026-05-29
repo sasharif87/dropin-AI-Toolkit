@@ -36,6 +36,11 @@ import subprocess
 import sys
 import time
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Ensure the script directory is on the path so imports work
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -515,7 +520,8 @@ def main():
     if args.code_model: models["code"] = args.code_model
     if args.quick_model: models["quick"] = args.quick_model
 
-    engine = Engine(url=args.url, models=models, code_url=args.code_url)
+    engine = Engine(url=args.url, models=models, code_url=args.code_url,
+                    role_ctx_caps=cfg.get("role_ctx_caps") or {})
 
     log("=" * 60)
     log("  DROP — Project Scaffolder & Dev Toolkit")

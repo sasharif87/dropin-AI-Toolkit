@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import threading
+import urllib.error
 import urllib.request
 from datetime import datetime
 
@@ -64,22 +65,21 @@ ROLE_CTX_CAPS = {
 class Engine:
 
     def __init__(self, url="http://localhost:11434",
-                 code_url="http://localhost:11434", models=None):
+                 code_url="http://localhost:11434", models=None, role_ctx_caps=None):
         """
         Args:
-            url:      Ollama URL for quick + reason roles.
-                      Default: localhost
-                        quick  -> qwen2.5-coder:7b
-                        reason -> qwen2.5:72b
-            code_url: Ollama URL for code role. Falls back to `url` if omitted.
-                      Default: localhost
-                        code   -> qwen2.5-coder:32b
-            models:   Optional dict pinning roles to specific model names,
-                      e.g. {"reason": "qwen2.5:72b", "code": "qwen2.5-coder:32b"}
+            url:           Ollama URL for quick + reason roles.
+            code_url:      Ollama URL for code role. Falls back to `url` if omitted.
+            models:        Optional dict pinning roles to specific model names.
+            role_ctx_caps: Optional dict overriding per-role KV-cache caps (tokens),
+                           e.g. {"code": 65536}.  Merges with ROLE_CTX_CAPS defaults.
         """
         self.url = url.rstrip("/")
         self.code_url = (code_url or url).rstrip("/")
         self.pinned = models or {}
+        self._role_ctx_caps = dict(ROLE_CTX_CAPS)
+        if role_ctx_caps:
+            self._role_ctx_caps.update({r: int(v) for r, v in role_ctx_caps.items()})
         self._available = None        # models on url (quick/reason host)
         self._available_code = None   # models on code_url
         self._resolved = {}           # role -> model name
@@ -119,9 +119,32 @@ class Engine:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 models = [m["name"] for m in data.get("models", [])]
-                return True, models, f"Connected ({url}) — {len(models)} model(s)"
+                return True, models, f"Connected ({url}) - {len(models)} model(s)"
         except Exception as e:
             return False, [], f"Cannot reach {url}: {e}"
+
+    def _query_running_models(self, host):
+        """Return list of {name, size_gb, vram_gb} for models Ollama currently has loaded.
+
+        Uses /api/ps (Ollama ≥0.1.33).  Returns [] on failure or older Ollama.
+        """
+        try:
+            req = urllib.request.Request(f"{host}/api/ps")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            result = []
+            for m in data.get("models", []):
+                size_gb = m.get("size", 0) / 1e9
+                vram_gb = m.get("size_vram", 0) / 1e9
+                result.append({
+                    "name": m.get("name", "?"),
+                    "size_gb": size_gb,
+                    "vram_gb": vram_gb,
+                    "ram_gb": size_gb - vram_gb,
+                })
+            return result
+        except Exception:
+            return []
 
     def _probe_model_ctx(self, model, host):
         """Return the model's actual context_length via /api/show, or None on failure.
@@ -290,8 +313,9 @@ class Engine:
                 ctx_src = "cap"
 
             size = _msz(model)
-            if hw and size:
-                fits = "ok" if size <= hw["vram_gb"] * 0.90 else "!!"
+            vram = hw["vram_gb"] if hw else None
+            if hw and size and vram is not None:
+                fits = "ok" if size <= vram * 0.90 else "!!"
                 size_tag = f"  [{fits} {size:.1f}GB]"
             elif size:
                 size_tag = f"  [{size:.1f}GB]"
@@ -299,7 +323,7 @@ class Engine:
                 size_tag = ""
 
             print(f"    {role:<8} -> {model}{pinned}  [{host}]"
-                  f"  ctx={ctx//1024}k ({ctx_src})  budget≈{budget//1000}k chars{size_tag}")
+                  f"  ctx={ctx//1024}k ({ctx_src})  budget~{budget//1000}k chars{size_tag}")
         print()
 
     # ── Hardware-aware preference sorting ────────────────────────────────────
@@ -313,7 +337,7 @@ class Engine:
         available the original preference order is returned unchanged.
         """
         hw = getattr(self, "_hardware", None)
-        if not hw:
+        if not hw or hw.get("vram_gb") is None:
             return MODEL_PREFERENCES[role]
         try:
             from hardware import model_size_gb
@@ -351,7 +375,7 @@ class Engine:
         modest hardware.  Adjust ROLE_CTX_CAPS at the top of this file if you
         have more VRAM and want larger effective windows.
         """
-        cap = ROLE_CTX_CAPS.get(role, CTX_DEFAULTS.get(role, 32_768))
+        cap = self._role_ctx_caps.get(role, CTX_DEFAULTS.get(role, 32_768))
         probed = self._probed_ctx.get(role)
         if probed:
             return min(probed, cap)
@@ -378,6 +402,7 @@ class Engine:
         model = self.model_for(role)
         host = self._resolved_hosts.get(role, self.code_url if role == "code" else self.url)
         last_exc = None
+        eff_ctx = num_ctx if num_ctx is not None else self.ctx_for_role(role)
 
         for attempt in range(1 + retries):
             # Force temperature=0 on retry so the model doesn't hallucinate again.
@@ -392,7 +417,7 @@ class Engine:
                 "stream": False,
                 "options": {
                     "temperature": eff_temp,
-                    "num_ctx": num_ctx if num_ctx is not None else self.ctx_for_role(role),
+                    "num_ctx": eff_ctx,
                 },
             }
             req = urllib.request.Request(
@@ -407,11 +432,44 @@ class Engine:
                     if response:
                         return response
                     if attempt < retries:
-                        log(f"  [retry {attempt + 1}/{retries}] empty response — retrying at temp=0")
+                        log(f"  [retry {attempt + 1}/{retries}] empty response - retrying at temp=0")
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace")
+                    body_json = json.loads(body)
+                    body = body_json.get("error", body)
+                except Exception:
+                    pass
+                last_exc = Exception(f"HTTP {e.code}: {body or e.reason}")
+                if e.code == 500 and "more system memory" in body:
+                    # Model weights don't fit in RAM — halving ctx won't help.
+                    # Query /api/ps so the user can see what's eating the RAM.
+                    running = self._query_running_models(host)
+                    ram_detail = ""
+                    if running:
+                        lines = [f"    {r['name']}: {r['size_gb']:.1f} GB total "
+                                 f"({r['vram_gb']:.1f} GB VRAM + {r['ram_gb']:.1f} GB RAM)"
+                                 for r in running]
+                        ram_detail = "\n  Models currently loaded on that host:\n" + "\n".join(lines)
+                    raise Exception(
+                        f"Model '{model}' needs more RAM than the Ollama host has free.\n"
+                        f"  Ollama says: {body}{ram_detail}\n"
+                        f"  Free RAM by running `ollama stop <model>` on the host, "
+                        f"or use a smaller model with --reason-model <name>."
+                    )
+                if attempt < retries:
+                    if e.code == 500:
+                        eff_ctx = max(eff_ctx // 2, 2048)
+                        log(f"  [retry {attempt + 1}/{retries}] HTTP 500: {body or e.reason} — retrying with ctx={eff_ctx}")
+                    else:
+                        log(f"  [retry {attempt + 1}/{retries}] HTTP {e.code}: {body or e.reason} — retrying")
+                else:
+                    raise last_exc
             except Exception as e:
                 last_exc = e
                 if attempt < retries:
-                    log(f"  [retry {attempt + 1}/{retries}] {e} — retrying")
+                    log(f"  [retry {attempt + 1}/{retries}] {e} - retrying")
                 else:
                     raise
 
@@ -425,6 +483,7 @@ class Engine:
         model = self.model_for(role)
         host = self._resolved_hosts.get(role, self.code_url if role == "code" else self.url)
         last_exc = None
+        eff_ctx = num_ctx if num_ctx is not None else self.ctx_for_role(role)
 
         for attempt in range(1 + retries):
             if attempt > 0 and temperature is None:
@@ -438,7 +497,7 @@ class Engine:
                 "stream": False,
                 "options": {
                     "temperature": eff_temp,
-                    "num_ctx": num_ctx if num_ctx is not None else self.ctx_for_role(role),
+                    "num_ctx": eff_ctx,
                 },
             }
             req = urllib.request.Request(
@@ -453,11 +512,34 @@ class Engine:
                     if response:
                         return response
                     if attempt < retries:
-                        log(f"  [retry {attempt + 1}/{retries}] empty response — retrying at temp=0")
+                        log(f"  [retry {attempt + 1}/{retries}] empty response - retrying at temp=0")
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace")
+                    body_json = json.loads(body)
+                    body = body_json.get("error", body)
+                except Exception:
+                    pass
+                last_exc = Exception(f"HTTP {e.code}: {body or e.reason}")
+                if e.code == 500 and "more system memory" in body:
+                    raise Exception(
+                        f"Model '{model}' needs more RAM than the Ollama host has available.\n"
+                        f"  Ollama says: {body}\n"
+                        f"  Try a smaller model with --reason-model <name>."
+                    )
+                if attempt < retries:
+                    if e.code == 500:
+                        eff_ctx = max(eff_ctx // 2, 2048)
+                        log(f"  [retry {attempt + 1}/{retries}] HTTP 500: {body or e.reason} — retrying with ctx={eff_ctx}")
+                    else:
+                        log(f"  [retry {attempt + 1}/{retries}] HTTP {e.code}: {body or e.reason} — retrying")
+                else:
+                    raise last_exc
             except Exception as e:
                 last_exc = e
                 if attempt < retries:
-                    log(f"  [retry {attempt + 1}/{retries}] {e} — retrying")
+                    log(f"  [retry {attempt + 1}/{retries}] {e} - retrying")
                 else:
                     raise
 
@@ -508,6 +590,20 @@ def read_file(path, max_chars=500_000):
         return None, "binary"
     except Exception as e:
         return None, str(e)
+
+
+def safe_abs_path(root, rel):
+    """Return a normalised absolute path only if rel stays inside root.
+
+    Rejects absolute paths and directory-traversal sequences.
+    Returns None when the path would escape the project root.
+    """
+    rel = rel.lstrip("/\\").replace("\\", "/")
+    abs_p = os.path.normpath(os.path.join(root, rel))
+    root_norm = os.path.normpath(root)
+    if abs_p != root_norm and not abs_p.startswith(root_norm + os.sep):
+        return None
+    return abs_p
 
 
 def chunk_text(text, max_chars, overlap=300):
@@ -573,6 +669,6 @@ def timed_input(prompt, timeout=0, default="y"):
     t.start()
     t.join(timeout)
     if result[0] is None:
-        print(f"(no response after {timeout}s — defaulting '{default}')")
+        print(f"(no response after {timeout}s - defaulting '{default}')")
         result[0] = default
     return result[0]

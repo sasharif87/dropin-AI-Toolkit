@@ -20,6 +20,7 @@ from collections import OrderedDict
 from datetime import datetime
 
 from engine import Engine, strip_fences, read_file, fmt_time, log, timed_input
+import config
 
 # ---------------------------------------------------------------------------
 # Fix prompt
@@ -123,9 +124,17 @@ def main():
     root = os.path.abspath(args.project_dir)
     docs = os.path.join(root, "docs")
 
-    models = {}
+    cfg = config.load()
+    if args.ollama_url == "http://localhost:11434" and cfg.get("url"):
+        args.ollama_url = cfg["url"]
+    code_url = getattr(args, "code_url", None)
+    if not code_url and cfg.get("code_url"):
+        code_url = cfg["code_url"]
+
+    models = dict(cfg.get("models", {}))
     if args.code_model: models["code"] = args.code_model
-    engine = Engine(url=args.ollama_url, models=models, code_url=getattr(args, "code_url", None))
+    engine = Engine(url=args.ollama_url, models=models, code_url=code_url,
+                    role_ctx_caps=cfg.get("role_ctx_caps") or {})
     ok, _, msg = engine.test()
     print(f"  Ollama: {msg}")
     if not ok: sys.exit(1)

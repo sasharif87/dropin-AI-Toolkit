@@ -40,21 +40,44 @@ def detect_gpu():
     """Detect GPU and available VRAM.
 
     Returns a dict with:
-        source   : "nvidia" | "rocm" | "metal" | "cpu"
+        source   : "nvidia" | "rocm" | "metal" | "cpu" | "unknown"
         gpu_name : str
-        vram_gb  : float  — usable budget (VRAM, or 60% of RAM for CPU)
+        vram_gb  : float | None  — None means detection unavailable (e.g. dropin
+                   running on a client machine calling a remote Ollama host).
+                   In that case model size filtering and !! warnings are suppressed.
         gpus     : list[{name, vram_gb}]
 
-    Never raises — falls back gracefully to a CPU estimate.
+    Never raises.  Falls back to "unknown" when tools are absent rather than
+    misusing local RAM as a proxy for the Ollama host's GPU budget.
     """
-    for probe in (_probe_nvidia, _probe_rocm, _probe_metal, _probe_cpu):
+    tools_missing = False
+
+    for probe in (_probe_nvidia, _probe_rocm, _probe_metal):
         try:
             result = probe()
             if result:
                 return result
+        except FileNotFoundError:
+            # Tool (nvidia-smi / rocm-smi / sysctl) not on PATH — we're
+            # probably on a client machine, not the inference host.
+            tools_missing = True
         except Exception:
             pass
-    return {"source": "cpu", "gpu_name": "unknown", "vram_gb": 4.0, "gpus": []}
+
+    # Only use CPU RAM estimate when we're confident no GPU tool exists at all
+    # AND no tool was simply missing from PATH.
+    if not tools_missing:
+        try:
+            result = _probe_cpu()
+            if result:
+                return result
+        except Exception:
+            pass
+
+    # GPU tools absent — Ollama is likely on a remote/different machine.
+    # Return None budget so callers skip size-based filtering.
+    return {"source": "unknown", "gpu_name": "unavailable (remote Ollama?)",
+            "vram_gb": None, "gpus": []}
 
 
 def _probe_nvidia():
@@ -262,10 +285,13 @@ def print_hardware(hw):
     src = hw["source"].upper()
     name = hw["gpu_name"]
     vram = hw["vram_gb"]
-    print(f"  [{src}] {name}  —  {vram:.1f} GB usable")
+    vram_str = f"{vram:.1f} GB usable" if vram is not None else "unknown VRAM"
+    print(f"  [{src}] {name}  —  {vram_str}")
     if len(hw.get("gpus", [])) > 1:
         for g in hw["gpus"]:
-            print(f"          {g['name']}: {g['vram_gb']:.1f} GB")
+            gv = g["vram_gb"]
+            gv_str = f"{gv:.1f} GB" if gv is not None else "unknown"
+            print(f"          {g['name']}: {gv_str}")
 
 
 def print_recommendation_table(rec, current_installed):

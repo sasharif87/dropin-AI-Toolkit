@@ -10,14 +10,13 @@ No config needed. Returns a structured dict that other scripts consume.
 """
 
 import os
-import re
 from collections import OrderedDict
 
 SKIP_DIRS = {
     "node_modules", ".venv", "venv", "env", ".next", "dist", "build",
     "__pycache__", ".git", ".github", ".agents", "docs", "__snapshots__",
     ".mypy_cache", ".pytest_cache", ".tox", "htmlcov", "coverage",
-    ".idea", ".vscode", "eggs", "*.egg-info",
+    ".idea", ".vscode", "eggs",
 }
 
 CODE_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs"}
@@ -175,7 +174,7 @@ def _detect_layers(root):
         full = os.path.join(root, item)
         if not os.path.isdir(full):
             continue
-        if item in SKIP_DIRS or item.startswith("."):
+        if item in SKIP_DIRS or item.startswith(".") or item.endswith(".egg-info"):
             continue
 
         # Skip test dirs — they're consumers, not layers

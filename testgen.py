@@ -13,12 +13,11 @@ Usage:
 import argparse
 import json
 import os
-import re
 import sys
 import time
-from datetime import datetime
 
-from engine import Engine, extract_json, strip_fences, read_file, fmt_time, log
+from engine import Engine, extract_json, strip_fences, read_file, fmt_time, log, safe_abs_path
+import config
 from detect import detect, print_detection
 from rules import build_all_rules, load_rules
 
@@ -256,9 +255,13 @@ class TestGenerator:
 
     def _write(self):
         root = self.info["root"]
-        written = skipped = 0
+        written = skipped = blocked = 0
         for rel, content in sorted(self.generated.items()):
-            abs_path = os.path.join(root, rel)
+            abs_path = safe_abs_path(root, rel)
+            if abs_path is None:
+                blocked += 1
+                print(f"    BLOCKED (unsafe path): {rel}")
+                continue
             if os.path.isfile(abs_path):
                 skipped += 1
                 continue
@@ -266,7 +269,7 @@ class TestGenerator:
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
             written += 1
-        log(f"  Written: {written} | Skipped: {skipped}")
+        log(f"  Written: {written} | Skipped: {skipped} | Blocked (unsafe): {blocked}")
 
     def _preview(self):
         root = self.info["root"]
@@ -275,10 +278,16 @@ class TestGenerator:
 
         log(f"\n  Would create {len(self.generated)} test files:\n")
         for path, content in sorted(self.generated.items()):
-            exists = " (EXISTS)" if os.path.isfile(os.path.join(root, path)) else ""
+            abs_path = safe_abs_path(root, path)
+            if abs_path is None:
+                print(f"    BLOCKED (unsafe path): {path}")
+                continue
+            exists = " (EXISTS)" if os.path.isfile(abs_path) else ""
             print(f"    {path:<55} {content.count(chr(10))+1:>4} lines{exists}")
 
-            preview_path = os.path.join(preview_dir, path.replace("/", os.sep))
+            preview_path = safe_abs_path(preview_dir, path)
+            if preview_path is None:
+                continue
             os.makedirs(os.path.dirname(preview_path), exist_ok=True)
             with open(preview_path, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -296,16 +305,25 @@ def main():
     parser.add_argument("--file", type=str)
     parser.add_argument("--integration", action="store_true")
     parser.add_argument("--ollama-url", type=str, default="http://localhost:11434")
+    parser.add_argument("--code-url", type=str, default=None,
+                        help="Ollama URL for code role. Defaults to --ollama-url.")
     parser.add_argument("--code-model", type=str)
     parser.add_argument("--quick-model", type=str)
     parser.add_argument("project_dir", nargs="?", default=".")
     args = parser.parse_args()
 
-    models = {}
+    cfg = config.load()
+    if args.ollama_url == "http://localhost:11434" and cfg.get("url"):
+        args.ollama_url = cfg["url"]
+    if not args.code_url and cfg.get("code_url"):
+        args.code_url = cfg["code_url"]
+
+    models = dict(cfg.get("models", {}))
     if args.code_model: models["code"] = args.code_model
     if args.quick_model: models["quick"] = args.quick_model
 
-    engine = Engine(url=args.ollama_url, models=models)
+    engine = Engine(url=args.ollama_url, code_url=args.code_url, models=models,
+                    role_ctx_caps=cfg.get("role_ctx_caps") or {})
     ok, _, msg = engine.test()
     print(f"  Ollama: {msg}")
     if not ok: sys.exit(1)

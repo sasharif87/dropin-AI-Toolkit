@@ -20,6 +20,7 @@ from collections import OrderedDict
 from datetime import datetime
 
 from engine import Engine, read_file, chunk_text, fmt_time, log
+import config
 from detect import detect, print_detection
 from rules import build_all_rules, load_rules, save_rules
 
@@ -339,11 +340,18 @@ def main():
     parser.add_argument("project_dir", nargs="?", default=".")
     args = parser.parse_args()
 
-    models = {}
+    cfg = config.load()
+    if args.ollama_url == "http://localhost:11434" and cfg.get("url"):
+        args.ollama_url = cfg["url"]
+    if args.code_url == "http://localhost:11434" and cfg.get("code_url"):
+        args.code_url = cfg["code_url"]
+
+    models = dict(cfg.get("models", {}))
     if args.code_model: models["code"] = args.code_model
     if args.reason_model: models["reason"] = args.reason_model
 
-    engine = Engine(url=args.ollama_url, code_url=args.code_url, models=models)
+    engine = Engine(url=args.ollama_url, code_url=args.code_url, models=models,
+                    role_ctx_caps=cfg.get("role_ctx_caps") or {})
     ok, _, msg = engine.test()
     print(f"  Ollama: {msg}")
     if not ok: sys.exit(1)

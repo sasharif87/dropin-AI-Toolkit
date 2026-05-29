@@ -21,6 +21,7 @@ import sys
 import time
 
 from engine import Engine, extract_json, strip_fences, read_file, fmt_time, log
+import config
 from detect import detect, print_detection
 from rules import build_all_rules, save_rules
 
@@ -546,12 +547,19 @@ def main():
     parser.add_argument("project_dir", nargs="?", default=".", help="Project root directory")
     args = parser.parse_args()
 
-    # Setup
-    models = {}
+    # Apply config file defaults where CLI args were left at their defaults
+    cfg = config.load()
+    if args.ollama_url == "http://localhost:11434" and cfg.get("url"):
+        args.ollama_url = cfg["url"]
+    if args.code_url == "http://localhost:11434" and cfg.get("code_url"):
+        args.code_url = cfg["code_url"]
+
+    models = dict(cfg.get("models", {}))
     if args.reason_model: models["reason"] = args.reason_model
     if args.code_model: models["code"] = args.code_model
 
-    engine = Engine(url=args.ollama_url, code_url=args.code_url, models=models)
+    engine = Engine(url=args.ollama_url, code_url=args.code_url, models=models,
+                    role_ctx_caps=cfg.get("role_ctx_caps") or {})
     ok, available, msg = engine.test()
     print(f"  Ollama: {msg}")
     if not ok:
