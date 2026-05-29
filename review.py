@@ -343,8 +343,8 @@ def main():
     cfg = config.load()
     if args.ollama_url == "http://localhost:11434" and cfg.get("url"):
         args.ollama_url = cfg["url"]
-    if args.code_url == "http://localhost:11434" and cfg.get("code_url"):
-        args.code_url = cfg["code_url"]
+    if args.code_url == "http://localhost:11434":
+        args.code_url = config.effective_code_url(cfg)
 
     models = dict(cfg.get("models", {}))
     if args.code_model: models["code"] = args.code_model

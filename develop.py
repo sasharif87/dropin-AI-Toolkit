@@ -286,12 +286,9 @@ class Developer:
             log(f"Cannot read {arch_path}: {err}")
             return None
 
-        # If reason and code resolved to the same model, skip the reason role for
-        # arch analysis — using the same large model twice in parallel stalls Ollama.
-        # Fall back to code model with a tighter context budget instead.
-        reason_model = self.engine.model_for("reason")
-        code_model = self.engine.model_for("code")
-        role = "reason" if reason_model != code_model else "code"
+        # Use code model for arch analysis — it's typically local (faster) and the
+        # JSON extraction task doesn't need the larger reasoning model.
+        role = "code"
         budget = self.engine.content_budget(role)
 
         log(f"  Arch doc: {arch_doc_rel} ({len(content):,} chars, budget={budget//1000}k)")
@@ -551,8 +548,8 @@ def main():
     cfg = config.load()
     if args.ollama_url == "http://localhost:11434" and cfg.get("url"):
         args.ollama_url = cfg["url"]
-    if args.code_url == "http://localhost:11434" and cfg.get("code_url"):
-        args.code_url = cfg["code_url"]
+    if args.code_url == "http://localhost:11434":
+        args.code_url = cfg.get("code_url") or args.ollama_url
 
     models = dict(cfg.get("models", {}))
     if args.reason_model: models["reason"] = args.reason_model

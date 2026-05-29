@@ -505,8 +505,9 @@ def main():
     }
     if args.url == _parser_defaults["url"] and cfg.get("url"):
         args.url = cfg["url"]
-    if args.code_url == _parser_defaults["code_url"] and cfg.get("code_url"):
-        args.code_url = cfg["code_url"]
+    if args.code_url == _parser_defaults["code_url"]:
+        # null code_url in config means "same as primary url"
+        args.code_url = cfg.get("code_url") or args.url
 
     # Apply catalog URL from config if set
     if cfg.get("catalog_url"):
@@ -546,9 +547,13 @@ def main():
 
     # ── Build rules ──
     rules_path = os.path.join(info["root"], "docs", ".layer_rules.json")
-    if os.path.isfile(rules_path) and args.command != "develop":
+    plan_only_mode = getattr(args, "plan_only", False)
+    if os.path.isfile(rules_path) and (args.command != "develop" or plan_only_mode):
         log(f"  Loading saved rules from docs/.layer_rules.json")
         rules = load_rules(rules_path)
+    elif plan_only_mode:
+        # plan_only never calls _generate_files so rules are unused — skip LLM call
+        rules = {}
     else:
         use_llm = not args.no_llm_rules and bool(info.get("arch_doc"))
         rules, _ = build_all_rules(engine, info, use_llm=use_llm)

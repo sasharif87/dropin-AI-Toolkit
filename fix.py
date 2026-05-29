@@ -128,8 +128,8 @@ def main():
     if args.ollama_url == "http://localhost:11434" and cfg.get("url"):
         args.ollama_url = cfg["url"]
     code_url = getattr(args, "code_url", None)
-    if not code_url and cfg.get("code_url"):
-        code_url = cfg["code_url"]
+    if not code_url or code_url == "http://localhost:11434":
+        code_url = config.effective_code_url(cfg)
 
     models = dict(cfg.get("models", {}))
     if args.code_model: models["code"] = args.code_model

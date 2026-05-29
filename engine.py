@@ -396,8 +396,10 @@ class Engine:
                  timeout=1800, retries=1):
         """Send prompt to Ollama. Model + host selected by role.
 
-        Retries once at temperature=0 on empty responses or transient network
-        errors.  Pass retries=0 to disable.
+        Uses streaming so tokens flow continuously — the socket stays alive for
+        slow/RAM-offloaded models and never times out mid-generation.
+        timeout is the per-chunk idle timeout, not total generation time.
+        Retries once at temperature=0 on empty responses or transient errors.
         """
         model = self.model_for(role)
         host = self._resolved_hosts.get(role, self.code_url if role == "code" else self.url)
@@ -405,34 +407,42 @@ class Engine:
         eff_ctx = num_ctx if num_ctx is not None else self.ctx_for_role(role)
 
         for attempt in range(1 + retries):
-            # Force temperature=0 on retry so the model doesn't hallucinate again.
             if attempt > 0 and temperature is None:
                 eff_temp = 0.0
             else:
                 eff_temp = temperature if temperature is not None else TEMP_DEFAULTS.get(role, 0.1)
 
+            options = {"temperature": eff_temp, "num_ctx": eff_ctx}
             data = {
                 "model": model,
                 "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": eff_temp,
-                    "num_ctx": eff_ctx,
-                },
+                "stream": True,
+                "options": options,
             }
+            if "qwen3" in model.lower():
+                data["think"] = False
             req = urllib.request.Request(
                 f"{host}/api/generate",
                 json.dumps(data).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
             try:
+                chunks = []
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
-                    response = result.get("response", "").strip()
-                    if response:
-                        return response
-                    if attempt < retries:
-                        log(f"  [retry {attempt + 1}/{retries}] empty response - retrying at temp=0")
+                    for raw_line in resp:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        chunk = json.loads(line.decode("utf-8"))
+                        if chunk.get("response"):
+                            chunks.append(chunk["response"])
+                        if chunk.get("done"):
+                            break
+                response = "".join(chunks).strip()
+                if response:
+                    return response
+                if attempt < retries:
+                    log(f"  [retry {attempt + 1}/{retries}] empty response - retrying at temp=0")
             except urllib.error.HTTPError as e:
                 body = ""
                 try:
@@ -443,8 +453,6 @@ class Engine:
                     pass
                 last_exc = Exception(f"HTTP {e.code}: {body or e.reason}")
                 if e.code == 500 and "more system memory" in body:
-                    # Model weights don't fit in RAM — halving ctx won't help.
-                    # Query /api/ps so the user can see what's eating the RAM.
                     running = self._query_running_models(host)
                     ram_detail = ""
                     if running:
@@ -479,7 +487,7 @@ class Engine:
 
     def chat(self, messages, *, role="code", temperature=None, num_ctx=None,
              timeout=1800, retries=1):
-        """Send chat messages to Ollama. Model selected by role."""
+        """Send chat messages to Ollama. Model selected by role. Uses streaming."""
         model = self.model_for(role)
         host = self._resolved_hosts.get(role, self.code_url if role == "code" else self.url)
         last_exc = None
@@ -491,28 +499,38 @@ class Engine:
             else:
                 eff_temp = temperature if temperature is not None else TEMP_DEFAULTS.get(role, 0.1)
 
+            options = {"temperature": eff_temp, "num_ctx": eff_ctx}
             data = {
                 "model": model,
                 "messages": messages,
-                "stream": False,
-                "options": {
-                    "temperature": eff_temp,
-                    "num_ctx": eff_ctx,
-                },
+                "stream": True,
+                "options": options,
             }
+            if "qwen3" in model.lower():
+                data["think"] = False
             req = urllib.request.Request(
                 f"{host}/api/chat",
                 json.dumps(data).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
             try:
+                chunks = []
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
-                    response = result.get("message", {}).get("content", "").strip()
-                    if response:
-                        return response
-                    if attempt < retries:
-                        log(f"  [retry {attempt + 1}/{retries}] empty response - retrying at temp=0")
+                    for raw_line in resp:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        chunk = json.loads(line.decode("utf-8"))
+                        content = chunk.get("message", {}).get("content", "")
+                        if content:
+                            chunks.append(content)
+                        if chunk.get("done"):
+                            break
+                response = "".join(chunks).strip()
+                if response:
+                    return response
+                if attempt < retries:
+                    log(f"  [retry {attempt + 1}/{retries}] empty response - retrying at temp=0")
             except urllib.error.HTTPError as e:
                 body = ""
                 try:

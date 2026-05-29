@@ -93,3 +93,8 @@ def engine_kwargs(cfg):
         "code_url": cfg.get("code_url"),
         "models": cfg.get("models", {}),
     }
+
+
+def effective_code_url(cfg):
+    """Return the code model URL: explicit value, or primary url when code_url is null."""
+    return cfg.get("code_url") or cfg.get("url", DEFAULT_CONFIG["url"])

@@ -50,8 +50,7 @@ def _base_cmd(cfg, project_dir, command):
            "--project", os.path.abspath(project_dir)]
     if cfg.get("url"):
         cmd += ["--url", cfg["url"]]
-    if cfg.get("code_url"):
-        cmd += ["--code-url", cfg["code_url"]]
+    cmd += ["--code-url", config.effective_code_url(cfg)]
     return cmd
 
 

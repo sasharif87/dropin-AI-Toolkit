@@ -220,6 +220,12 @@ def _detect_layers(root):
             if layer["file_count"] > 0:
                 layers[item] = layer
 
+    # If no subdirectory layers found, treat root-level source files as a single layer
+    if not layers:
+        root_layer = _build_layer_info(root, ".", root, recurse=False)
+        if root_layer["file_count"] > 0:
+            layers["."] = root_layer
+
     return layers
 
 
