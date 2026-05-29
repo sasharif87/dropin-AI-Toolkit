@@ -170,6 +170,9 @@ def fetch(url, cache_path=CATALOG_CACHE):
             f"Got keys: {list(data.keys())}"
         )
 
+    global _catalog
+    _catalog = data  # update in-memory cache immediately so active() reflects new data
+
     if cache_path:
         try:
             with open(cache_path, "w", encoding="utf-8") as f:
