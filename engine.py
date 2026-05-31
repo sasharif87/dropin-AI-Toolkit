@@ -15,9 +15,7 @@ import os
 import re
 import sys
 import threading
-import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from catalog import preferences as _cat_prefs, ctx_windows as _cat_ctx
@@ -54,9 +52,9 @@ CHARS_PER_TOKEN = 3.0
 # lower them if Ollama is OOM-ing.  ctx_for_role() uses these as a ceiling
 # even when the chosen model's architecture supports a larger window.
 ROLE_CTX_CAPS = {
-    "reason": 65_536,   # large enough for arch docs + consolidation
-    "code":   32_768,   # safe default for most desktop setups
-    "quick":   8_192,   # fast classification needs little context
+    "reason": 65_536,  # large enough for arch docs + consolidation
+    "code": 32_768,  # safe default for most desktop setups
+    "quick": 8_192,  # fast classification needs little context
 }
 
 
@@ -64,9 +62,13 @@ ROLE_CTX_CAPS = {
 # Engine — Ollama client with automatic model selection per task role
 # ---------------------------------------------------------------------------
 class Engine:
-
-    def __init__(self, url="http://localhost:11434",
-                 code_url="http://localhost:11434", models=None, role_ctx_caps=None):
+    def __init__(
+        self,
+        url="http://localhost:11434",
+        code_url="http://localhost:11434",
+        models=None,
+        role_ctx_caps=None,
+    ):
         """
         Args:
             url:           Ollama URL for quick + reason roles.
@@ -81,13 +83,12 @@ class Engine:
         self._role_ctx_caps = dict(ROLE_CTX_CAPS)
         if role_ctx_caps:
             self._role_ctx_caps.update({r: int(v) for r, v in role_ctx_caps.items()})
-        self._available = None        # models on url (quick/reason host)
-        self._available_code = None   # models on code_url
-        self._resolved = {}           # role -> model name
-        self._resolved_hosts = {}     # role -> host URL (tracks where the model actually lives)
-        self._probed_ctx = {}         # role -> context_length from /api/show (live probe)
-        self._hardware = None         # result of hardware.detect_gpu()
-        self._lock = threading.Lock()
+        self._available = None  # models on url (quick/reason host)
+        self._available_code = None  # models on code_url
+        self._resolved = {}  # role -> model name
+        self._resolved_hosts = {}  # role -> host URL (tracks where the model actually lives)
+        self._probed_ctx = {}  # role -> context_length from /api/show (live probe)
+        self._hardware = None  # result of hardware.detect_gpu()
 
     # ── Connection & model discovery ─────────────────────────────────────────
 
@@ -107,20 +108,13 @@ class Engine:
             # Detect hardware before resolving so preference sorting can use it.
             try:
                 from hardware import detect_gpu
+
                 self._hardware = detect_gpu()
             except Exception:
                 self._hardware = None
             self._resolve_models()
             self._probe_all_model_ctx()
         return ok, models, msg
-
-    def _ensure_ready(self):
-        """Initialize connection and resolve models if not done yet. Thread-safe."""
-        if self._available is not None:
-            return
-        with self._lock:
-            if self._available is None:
-                self.test()
 
     def _probe(self, url):
         """Query /api/tags on a host. Returns (ok, model_list, message)."""
@@ -146,12 +140,14 @@ class Engine:
             for m in data.get("models", []):
                 size_gb = m.get("size", 0) / 1e9
                 vram_gb = m.get("size_vram", 0) / 1e9
-                result.append({
-                    "name": m.get("name", "?"),
-                    "size_gb": size_gb,
-                    "vram_gb": vram_gb,
-                    "ram_gb": size_gb - vram_gb,
-                })
+                result.append(
+                    {
+                        "name": m.get("name", "?"),
+                        "size_gb": size_gb,
+                        "vram_gb": vram_gb,
+                        "ram_gb": size_gb - vram_gb,
+                    }
+                )
             return result
         except Exception:
             return []
@@ -191,34 +187,20 @@ class Engine:
         """Call /api/show for every resolved model and cache context lengths.
 
         Results take priority over MODEL_CTX_WINDOWS in ctx_for_role().
-        Duplicate model/host pairs are probed in parallel, each only once.
+        Duplicate model/host pairs are probed only once.
         """
         self._probed_ctx = {}
-        role_keys = {}  # (model, host) -> [roles]
+        seen = {}  # (model, host) -> ctx
         for role in ("reason", "code", "quick"):
             model = self._resolved.get(role)
             if not model:
                 continue
             host = self._resolved_hosts.get(role, self.url)
-            role_keys.setdefault((model, host), []).append(role)
-
-        if not role_keys:
-            return
-
-        with ThreadPoolExecutor(max_workers=len(role_keys)) as pool:
-            futures = {
-                pool.submit(self._probe_model_ctx, model, host): (model, host)
-                for model, host in role_keys
-            }
-            for fut in as_completed(futures):
-                key = futures[fut]
-                try:
-                    ctx = fut.result()
-                except Exception:
-                    ctx = None
-                if ctx:
-                    for role in role_keys[key]:
-                        self._probed_ctx[role] = ctx
+            key = (model, host)
+            if key not in seen:
+                seen[key] = self._probe_model_ctx(model, host)
+            if seen[key]:
+                self._probed_ctx[role] = seen[key]
 
     def _resolve_models(self):
         """Pick the best available model for each role.
@@ -229,23 +211,31 @@ class Engine:
           quick  -> qwen2.5-coder:7b preferred
         """
         if self._available is None:
-            return  # not ready; test() hasn't run yet
+            self.test()
+            if self._available is None:
+                return
 
         for role in ("reason", "code", "quick"):
             # Check pinned first
             if role in self.pinned:
                 self._resolved[role] = self.pinned[role]
                 # Pinned code models go to code_url; everything else to url
-                self._resolved_hosts[role] = self.code_url if role == "code" else self.url
+                self._resolved_hosts[role] = (
+                    self.code_url if role == "code" else self.url
+                )
                 continue
 
             # Route code+reason to code_url host; quick stays on primary url.
             # reason falls back to primary url pool if nothing usable on code_url host.
             code_host_available = bool(self._available_code)
             if role == "code":
-                pool = self._available_code if code_host_available else (self._available or [])
+                pool = (
+                    self._available_code
+                    if code_host_available
+                    else (self._available or [])
+                )
                 preferred_host = self.code_url if code_host_available else self.url
-                fallback_pool, fallback_host = [], self.url
+                fallback_pool, fallback_host = [], None
             elif role == "reason":
                 # Prefer code host for consolidation quality; fall back to primary host
                 if code_host_available:
@@ -256,11 +246,11 @@ class Engine:
                 else:
                     pool = self._available or []
                     preferred_host = self.url
-                    fallback_pool, fallback_host = [], self.url
+                    fallback_pool, fallback_host = [], None
             else:  # quick
                 pool = self._available or []
                 preferred_host = self.url
-                fallback_pool, fallback_host = [], self.url
+                fallback_pool, fallback_host = [], None
 
             if not pool:
                 pool = self._available or []
@@ -301,17 +291,18 @@ class Engine:
     def model_for(self, role):
         """Get the resolved model name for a role."""
         if not self._resolved:
-            self._ensure_ready()
-        return self._resolved.get(role, self.pinned.get(role, "llama3.1:8b"))
+            self._resolve_models()
+        return self._resolved.get(role, self.pinned.get("code", "llama3.1:8b"))
 
     def print_model_map(self):
         """Print which model is assigned to which role and which host."""
         if not self._resolved:
-            self._ensure_ready()
+            self._resolve_models()
 
         hw = getattr(self, "_hardware", None)
         if hw:
             from hardware import print_hardware
+
             print_hardware(hw)
 
         try:
@@ -319,7 +310,7 @@ class Engine:
         except ImportError:
             _msz = lambda _: None  # noqa: E731
 
-        print("\n  Model assignments:")
+        print(f"\n  Model assignments:")
         for role in ("reason", "code", "quick"):
             model = self._resolved.get(role, "?")
             pinned = " (pinned)" if role in self.pinned else " (auto)"
@@ -344,14 +335,16 @@ class Engine:
             else:
                 size_tag = ""
 
-            print(f"    {role:<8} -> {model}{pinned}  [{host}]"
-                  f"  ctx={ctx//1024}k ({ctx_src})  budget~{budget//1000}k chars{size_tag}")
+            print(
+                f"    {role:<8} -> {model}{pinned}  [{host}]"
+                f"  ctx={ctx // 1024}k ({ctx_src})  budget~{budget // 1000}k chars{size_tag}"
+            )
         print()
 
     # ── Hardware-aware preference sorting ────────────────────────────────────
 
     def _hw_sorted_prefs(self, role):
-        """Return preferences for *role* with hardware-fitting models first.
+        """Return MODEL_PREFERENCES[role] with hardware-fitting models first.
 
         Models whose catalogued VRAM requirement exceeds the detected budget are
         demoted to the end of the list.  Models not in the size catalog are left
@@ -360,28 +353,26 @@ class Engine:
         """
         hw = getattr(self, "_hardware", None)
         if not hw or hw.get("vram_gb") is None:
-            return _cat_prefs(role)
+            return MODEL_PREFERENCES[role]
         try:
             from hardware import model_size_gb
         except ImportError:
-            return _cat_prefs(role)
+            return MODEL_PREFERENCES[role]
 
         budget = hw["vram_gb"] * 0.90
-        prefs = _cat_prefs(role)
-        fitting = [m for m in prefs
-                   if (sz := model_size_gb(m)) is None or sz <= budget]
+        prefs = MODEL_PREFERENCES[role]
+        fitting = [m for m in prefs if (sz := model_size_gb(m)) is None or sz <= budget]
         non_fitting = [m for m in prefs if m not in set(fitting)]
         return fitting + non_fitting
 
     # ── Context-window helpers ────────────────────────────────────────────────
 
     def _model_ctx(self, model):
-        """Context window (tokens) from catalog registry; None if unknown."""
-        ctx_windows = _cat_ctx()
-        if model in ctx_windows:
-            return ctx_windows[model]
+        """Context window (tokens) from registry; None if unknown."""
+        if model in MODEL_CTX_WINDOWS:
+            return MODEL_CTX_WINDOWS[model]
         base = model.split(":")[0]
-        for key, ctx in ctx_windows.items():
+        for key, ctx in MODEL_CTX_WINDOWS.items():
             if key.split(":")[0] == base:
                 return ctx
         return None
@@ -413,90 +404,110 @@ class Engine:
         """
         return int(self.ctx_for_role(role) * CHARS_PER_TOKEN * 0.72)
 
+    # ── Model warmup ─────────────────────────────────────────────────────────
+
+    def _is_model_loaded(self, model, host):
+        """Return True if model is currently loaded in Ollama (/api/ps)."""
+        try:
+            req = urllib.request.Request(f"{host}/api/ps")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            loaded = [m["name"] for m in data.get("models", [])]
+            return any(
+                m == model or m.split(":")[0] == model.split(":")[0] for m in loaded
+            )
+        except Exception:
+            return False
+
+    def _ensure_loaded(self, model, host, role):
+        """Load model into memory before inference if it isn't already.
+
+        Sends a trivial prompt so Ollama allocates VRAM/RAM upfront. Without
+        this, a cold 70B model load can eat into the generation timeout or fail
+        Ollama's free-memory pre-flight check after page-cache churn.
+        """
+        if self._is_model_loaded(model, host):
+            return
+        log(f"  Loading {model} into memory...")
+        t0 = time.time()
+        try:
+            data = {
+                "model": model,
+                "prompt": "hi",
+                "stream": False,
+                "options": {"num_predict": 1},
+            }
+            req = urllib.request.Request(
+                f"{host}/api/generate",
+                json.dumps(data).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                json.loads(resp.read().decode("utf-8"))
+            log(f"  {model} ready ({fmt_time(time.time() - t0)})")
+        except Exception as e:
+            log(f"  WARNING: could not pre-load {model}: {e}")
+
     # ── Generation ───────────────────────────────────────────────────────────
 
-    def _stream_request(self, endpoint, payload_key, payload_value, extract_fn, *,
-                        role, temperature, num_ctx, timeout, retries):
-        """Core streaming request loop shared by generate() and chat().
+    def generate(
+        self,
+        prompt,
+        *,
+        role="code",
+        temperature=None,
+        num_ctx=None,
+        timeout=7200,
+        retries=1,
+    ):
+        """Send prompt to Ollama. Model + host selected by role.
 
-        endpoint:      e.g. "/api/generate" or "/api/chat"
-        payload_key:   "prompt" or "messages"
-        payload_value: the prompt string or messages list
-        extract_fn:    callable(chunk) -> str token, called per streamed chunk
+        Retries once at temperature=0 on empty responses or transient network
+        errors.  Pass retries=0 to disable.
         """
         model = self.model_for(role)
-        host = self._resolved_hosts.get(role, self.code_url if role == "code" else self.url)
+        host = self._resolved_hosts.get(
+            role, self.code_url if role == "code" else self.url
+        )
+        self._ensure_loaded(model, host, role)
         last_exc = None
         eff_ctx = num_ctx if num_ctx is not None else self.ctx_for_role(role)
 
         for attempt in range(1 + retries):
+            # Force temperature=0 on retry so the model doesn't hallucinate again.
             if attempt > 0 and temperature is None:
                 eff_temp = 0.0
             else:
-                eff_temp = temperature if temperature is not None else TEMP_DEFAULTS.get(role, 0.1)
+                eff_temp = (
+                    temperature
+                    if temperature is not None
+                    else TEMP_DEFAULTS.get(role, 0.1)
+                )
 
             data = {
                 "model": model,
-                payload_key: payload_value,
-                "stream": True,
-                "options": {"temperature": eff_temp, "num_ctx": eff_ctx},
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": eff_temp,
+                    "num_ctx": eff_ctx,
+                },
             }
-            if "qwen3" in model.lower():
-                data["think"] = False
             req = urllib.request.Request(
-                f"{host}{endpoint}",
+                f"{host}/api/generate",
                 json.dumps(data).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
             try:
-                chunks = []
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    for raw_line in resp:
-                        line = raw_line.strip()
-                        if not line:
-                            continue
-                        chunk = json.loads(line.decode("utf-8"))
-                        token = extract_fn(chunk)
-                        if token:
-                            chunks.append(token)
-                        if chunk.get("done"):
-                            break
-                response = "".join(chunks).strip()
-                if response:
-                    return response
-                if attempt < retries:
-                    log(f"  [retry {attempt + 1}/{retries}] empty response - retrying at temp=0")
-            except urllib.error.HTTPError as e:
-                body = ""
-                try:
-                    body = e.read().decode("utf-8", errors="replace")
-                    body_json = json.loads(body)
-                    body = body_json.get("error", body)
-                except Exception:
-                    pass
-                last_exc = Exception(f"HTTP {e.code}: {body or e.reason}")
-                if e.code == 500 and "more system memory" in body:
-                    running = self._query_running_models(host)
-                    ram_detail = ""
-                    if running:
-                        lines = [f"    {r['name']}: {r['size_gb']:.1f} GB total "
-                                 f"({r['vram_gb']:.1f} GB VRAM + {r['ram_gb']:.1f} GB RAM)"
-                                 for r in running]
-                        ram_detail = "\n  Models currently loaded on that host:\n" + "\n".join(lines)
-                    raise Exception(
-                        f"Model '{model}' needs more RAM than the Ollama host has free.\n"
-                        f"  Ollama says: {body}{ram_detail}\n"
-                        f"  Free RAM by running `ollama stop <model>` on the host, "
-                        f"or use a smaller model with --reason-model <name>."
-                    )
-                if attempt < retries:
-                    if e.code == 500:
-                        eff_ctx = max(eff_ctx // 2, 2048)
-                        log(f"  [retry {attempt + 1}/{retries}] HTTP 500: {body or e.reason} — retrying with ctx={eff_ctx}")
-                    else:
-                        log(f"  [retry {attempt + 1}/{retries}] HTTP {e.code}: {body or e.reason} — retrying")
-                else:
-                    raise last_exc
+                    result = json.loads(resp.read().decode("utf-8"))
+                    response = result.get("response", "").strip()
+                    if response:
+                        return response
+                    if attempt < retries:
+                        log(
+                            f"  [retry {attempt + 1}/{retries}] empty response — retrying at temp=0"
+                        )
             except Exception as e:
                 last_exc = e
                 if attempt < retries:
@@ -508,31 +519,69 @@ class Engine:
             raise last_exc
         return ""
 
-    def generate(self, prompt, *, role="code", temperature=None, num_ctx=None,
-                 timeout=1800, retries=1):
-        """Send prompt to Ollama. Model + host selected by role.
-
-        Uses streaming so tokens flow continuously — the socket stays alive for
-        slow/RAM-offloaded models and never times out mid-generation.
-        timeout is the per-chunk idle timeout, not total generation time.
-        Retries once at temperature=0 on empty responses or transient errors.
-        """
-        return self._stream_request(
-            "/api/generate", "prompt", prompt,
-            lambda chunk: chunk.get("response", ""),
-            role=role, temperature=temperature, num_ctx=num_ctx,
-            timeout=timeout, retries=retries,
+    def chat(
+        self,
+        messages,
+        *,
+        role="code",
+        temperature=None,
+        num_ctx=None,
+        timeout=7200,
+        retries=1,
+    ):
+        """Send chat messages to Ollama. Model selected by role."""
+        model = self.model_for(role)
+        host = self._resolved_hosts.get(
+            role, self.code_url if role == "code" else self.url
         )
+        self._ensure_loaded(model, host, role)
+        last_exc = None
+        eff_ctx = num_ctx if num_ctx is not None else self.ctx_for_role(role)
 
-    def chat(self, messages, *, role="code", temperature=None, num_ctx=None,
-             timeout=1800, retries=1):
-        """Send chat messages to Ollama. Model selected by role. Uses streaming."""
-        return self._stream_request(
-            "/api/chat", "messages", messages,
-            lambda chunk: chunk.get("message", {}).get("content", ""),
-            role=role, temperature=temperature, num_ctx=num_ctx,
-            timeout=timeout, retries=retries,
-        )
+        for attempt in range(1 + retries):
+            if attempt > 0 and temperature is None:
+                eff_temp = 0.0
+            else:
+                eff_temp = (
+                    temperature
+                    if temperature is not None
+                    else TEMP_DEFAULTS.get(role, 0.1)
+                )
+
+            data = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "temperature": eff_temp,
+                    "num_ctx": eff_ctx,
+                },
+            }
+            req = urllib.request.Request(
+                f"{host}/api/chat",
+                json.dumps(data).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                    response = result.get("message", {}).get("content", "").strip()
+                    if response:
+                        return response
+                    if attempt < retries:
+                        log(
+                            f"  [retry {attempt + 1}/{retries}] empty response — retrying at temp=0"
+                        )
+            except Exception as e:
+                last_exc = e
+                if attempt < retries:
+                    log(f"  [retry {attempt + 1}/{retries}] {e} - retrying")
+                else:
+                    raise
+
+        if last_exc:
+            raise last_exc
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -552,14 +601,11 @@ def extract_json(text):
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # raw_decode finds the first valid JSON object/array regardless of nesting depth,
-    # without greedy regex that would swallow surrounding text.
-    decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch in ('{', '['):
+    for pattern in [r"\{[\s\S]*\}", r"\[[\s\S]*\]"]:
+        m = re.search(pattern, text)
+        if m:
             try:
-                obj, _ = decoder.raw_decode(text, i)
-                return obj
+                return json.loads(m.group())
             except json.JSONDecodeError:
                 continue
     return None
@@ -572,9 +618,8 @@ def read_file(path, max_chars=500_000):
     files.  Pass a smaller max_chars to keep the old reject-early behaviour.
     """
     try:
-        size = os.path.getsize(path)
-        if size > max_chars:
-            return None, f"too large ({size:,} bytes)"
+        if os.path.getsize(path) > max_chars:
+            return None, f"too large ({os.path.getsize(path):,} bytes)"
         with open(path, "r", encoding="utf-8") as f:
             return f.read(), None
     except UnicodeDecodeError:
@@ -642,42 +687,26 @@ def log(msg):
 
 
 def timed_input(prompt, timeout=0, default="y"):
-    """Prompt for input. If timeout > 0 and no response arrives, returns default.
-
-    Uses platform-native non-blocking I/O (msvcrt on Windows, select on Unix)
-    so no background thread is left alive holding stdin after the timeout.
-    """
+    """Prompt for input. If timeout > 0 and no response arrives, returns default."""
     if timeout <= 0:
         try:
             return input(prompt).strip().lower()
         except (EOFError, KeyboardInterrupt):
             return ""
 
-    import time
     print(prompt, end=" ", flush=True)
+    result = [None]
 
-    if sys.platform == "win32":
-        import msvcrt
-        deadline = time.monotonic() + timeout
-        chars = []
-        while time.monotonic() < deadline:
-            if msvcrt.kbhit():
-                ch = msvcrt.getwche()
-                if ch in ('\r', '\n'):
-                    print()
-                    return "".join(chars).strip().lower()
-                if ch == '\x08' and chars:  # backspace
-                    chars.pop()
-                    print("\b \b", end="", flush=True)
-                else:
-                    chars.append(ch)
-            time.sleep(0.05)
-        print(f"\n(no response after {timeout}s - defaulting '{default}')")
-        return default
+    def _read():
+        try:
+            result[0] = sys.stdin.readline().strip().lower()
+        except Exception:
+            result[0] = default
 
-    import select  # Unix path
-    r, _, _ = select.select([sys.stdin], [], [], timeout)
-    if r:
-        return sys.stdin.readline().strip().lower()
-    print(f"\n(no response after {timeout}s - defaulting '{default}')")
-    return default
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    t.join(timeout)
+    if result[0] is None:
+        print(f"(no response after {timeout}s - defaulting '{default}')")
+        result[0] = default
+    return result[0]
