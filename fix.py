@@ -1,6 +1,10 @@
 """
 fix.py — Apply code review fixes via Ollama.
 
+Reads structured findings from docs/review_findings.json (written by
+review.py). The legacy markdown-report path survives only behind the
+deprecated --report flag.
+
 Usage:
     python fix.py                         # dry-run
     python fix.py --apply                 # write fixes
@@ -9,18 +13,17 @@ Usage:
 
 import argparse
 import difflib
-import json
 import os
 import py_compile
 import re
 import sys
 import tempfile
-import time
 from collections import OrderedDict
 from datetime import datetime
 
-from engine import Engine, strip_fences, read_file, fmt_time, log, timed_input
+from engine import Engine, strip_fences, read_file, log, timed_input
 import config
+import findings as fnd
 
 # ---------------------------------------------------------------------------
 # Fix prompt
@@ -50,10 +53,47 @@ ORIGINAL FILE ({filepath}):
 
 
 # ---------------------------------------------------------------------------
-# Report parser
+# Findings input — JSON is the contract with review.py
 # ---------------------------------------------------------------------------
+def _format_issue(f):
+    """Render one finding as an issue line for the fix prompt."""
+    parts = []
+    if f.get("line") is not None:
+        parts.append(f"Line {f['line']}:")
+    tags = "/".join(t for t in (f.get("severity"), f.get("rule_label")) if t)
+    if tags:
+        parts.append(f"[{tags}]")
+    parts.append(f.get("description", ""))
+    if f.get("quote"):
+        parts.append(f"(code: `{f['quote']}`)")
+    return "- " + " ".join(parts)
+
+
+def entries_from_findings(root):
+    """Load docs/review_findings.json → list of (rel_path, issues_text, findings).
+
+    Findings already rejected by the test gate are skipped so re-runs don't
+    retry a fix that broke tests. Returns None when no findings file exists.
+    """
+    data = fnd.load_findings(root)
+    if data is None:
+        return None
+    by_file = OrderedDict()
+    for f in data["findings"]:
+        if f.get("fix_rejected"):
+            continue
+        by_file.setdefault(f["file"], []).append(f)
+    return [(rel, "\n".join(_format_issue(f) for f in items), items)
+            for rel, items in by_file.items()]
+
+
 def parse_report(path):
-    """Parse review report → list of (rel_path, issues_text)."""
+    """DEPRECATED legacy parser for prose markdown reports (--report only).
+
+    Markdown reports are now rendered views of review_findings.json; this
+    regex path exists only so old reports remain usable.
+    Returns list of (rel_path, issues_text, []).
+    """
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -65,7 +105,7 @@ def parse_report(path):
         issues = issues.strip()
         if issues.startswith("**Skipped**") or issues.startswith("**Error**") or not issues:
             continue
-        entries.append((rel.strip(), issues))
+        entries.append((rel.strip(), issues, []))
     return entries
 
 
@@ -111,7 +151,9 @@ def main():
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--layer", type=str)
     parser.add_argument("--file", type=str)
-    parser.add_argument("--report", type=str)
+    parser.add_argument("--report", type=str,
+                        help="DEPRECATED: parse a legacy markdown report instead of "
+                             "docs/review_findings.json")
     parser.add_argument("--timeout", type=int, default=0,
                         help="Seconds to wait at prompt before auto-proceeding with the safe default 'n'")
     parser.add_argument("--yes", action="store_true",
@@ -141,26 +183,28 @@ def main():
     print(f"  Ollama: {msg}")
     if not ok: sys.exit(1)
 
-    # Find report
-    report = args.report
-    if not report:
-        con = os.path.join(docs, "code_review_report_consolidated.md")
-        raw = os.path.join(docs, "code_review_report.md")
-        report = con if os.path.isfile(con) else raw if os.path.isfile(raw) else None
-    if not report or not os.path.isfile(report):
-        log("No review report found. Run review.py first.")
-        return
-
-    entries = parse_report(report)
+    # Load findings — JSON is the default; --report is the deprecated legacy path.
+    if args.report:
+        log(f"WARNING: --report is deprecated. Markdown reports are rendered views of "
+            f"docs/{fnd.FINDINGS_NAME}; run a fresh review to use the JSON path.")
+        if not os.path.isfile(args.report):
+            log(f"Report not found: {args.report}")
+            return
+        entries = parse_report(args.report)
+    else:
+        entries = entries_from_findings(root)
+        if entries is None:
+            log(f"No docs/{fnd.FINDINGS_NAME} found. Run review.py first.")
+            return
     if not entries:
-        log("No issues in report.")
+        log("No open findings to fix.")
         return
 
     if args.file:
-        entries = [(p, i) for p, i in entries if p == args.file]
+        entries = [(p, i, fs) for p, i, fs in entries if p == args.file]
     if args.layer:
         fset = {l.strip().lower() for l in args.layer.split(",")}
-        entries = [(p, i) for p, i in entries
+        entries = [(p, i, fs) for p, i, fs in entries
                    if any(p.startswith(l) or p.split("/")[-2] in fset for l in fset)]
 
     mode = "APPLY" if args.apply else "DRY-RUN"
@@ -177,7 +221,7 @@ def main():
     with open(patch_path, "w", encoding="utf-8") as pf:
         pf.write(f"# Fix patches — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
 
-        for i, (rel, issues) in enumerate(entries, 1):
+        for i, (rel, issues, file_findings) in enumerate(entries, 1):
             print(f"  [{i}/{len(entries)}] {rel}...", end=" ", flush=True)
 
             abs_path = os.path.join(root, rel)

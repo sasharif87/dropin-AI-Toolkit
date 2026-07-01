@@ -1,8 +1,13 @@
 """
-review.py — Layer-aware code review with grounding check.
+review.py — Layer-aware code review with structured findings.
 
-Uses the code model for per-file review, reasoning model for consolidation.
-Auto-generates rules if none exist. Strips hallucinated findings via grounding check.
+Pass 1 uses the code model per file and asks for findings as JSON objects.
+Grounding, dedup, and consolidation all operate on the JSON list —
+docs/review_findings.json is the source of truth; the markdown reports are
+rendered views of it. Hallucinated findings (quote not present in the
+source) are stripped by the grounding check. A prose fallback parser
+recovers findings when the model ignores the JSON instruction; those are
+tagged "parsed": "prose".
 
 Usage:
     python review.py                           # review all
@@ -12,6 +17,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -19,8 +25,9 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 
-from engine import Engine, read_file, chunk_text, fmt_time, log
+from engine import Engine, extract_json, read_file, chunk_text, fmt_time, log
 import config
+import findings as fnd
 from detect import detect, print_detection
 from rules import build_all_rules, load_rules, save_rules
 
@@ -34,13 +41,18 @@ REVIEW RULES — follow strictly:
 2. DO NOT give generic advice ("add type hints", "add docstrings") unless there's a concrete bug.
 3. DO check for violations of the layer rules below.
 4. DO check for real bugs, logic errors, security issues, race conditions, data integrity problems.
-5. If the file is clean, respond with EXACTLY "OK" and nothing else.
-6. Each finding MUST include:
-   a. Line number (e.g. "Line 42:")
-   b. Backtick-quoted snippet of the EXACT problematic code
-   c. What's wrong and which rule it violates
-7. CRITICAL: If you cannot quote the exact code, DO NOT report it.
-8. Top 5 max. Priority: bugs > security > rule violations > style.
+5. Report at most 5 findings. Priority: bugs > security > rule violations > style.
+6. Every finding MUST quote the EXACT problematic code, copied verbatim from the file.
+   CRITICAL: if you cannot quote the exact code, DO NOT report it.
+
+Return ONLY a JSON array — no markdown fences, no commentary. Each element:
+  {{"line": <line number>,
+   "severity": "bug" | "security" | "rule" | "style",
+   "rule_label": "<short name of the violated rule, or 'bug'>",
+   "quote": "<exact code copied from the file>",
+   "description": "<what is wrong and why>"}}
+
+If the file is clean, return exactly: []
 
 LAYER RULES:
 {rules}
@@ -54,53 +66,71 @@ File: {filepath}
 
 CONSOLIDATION_PROMPT = """You are a senior principal engineer doing a second-pass review consolidation.
 
-Given raw first-pass findings, produce a clean consolidated review:
-1. Deduplicate same-root-cause findings across files
-2. Cross-reference related findings between files
-3. Remove noise (generic advice, summaries, empty __init__.py)
-4. Rank: bugs > security > architecture > style
-5. End with 1-2 sentence health assessment
+The input is a JSON array of first-pass code review findings. Produce a
+consolidated set:
+1. Deduplicate same-root-cause findings (keep one; mention other affected files in its description)
+2. Cross-reference related findings between files in the descriptions
+3. Remove noise: generic advice, code summaries, findings that are not actionable
+4. Rank: bugs > security > rule violations > style
+5. Keep the original "file", "line", "quote", "rule_label" fields of every finding you keep — never invent new files or quotes.
 
-OUTPUT FORMAT:
-### [Layer Name]
-**Health**: [one-line assessment]
-**Findings** (ranked):
-- **[severity]** `file` — description
-...
+Return ONLY valid JSON — no markdown, no commentary:
+{{"health": "<1-2 sentence health assessment of this code>",
+ "findings": [<kept findings, same schema as the input, ranked most severe first>]}}
 
-If no real findings: "**Health**: Clean — no actionable issues."
+If nothing is actionable: {{"health": "Clean — no actionable issues.", "findings": []}}
 
-RAW FINDINGS:
-{findings}
+FIRST-PASS FINDINGS:
+{findings_json}
 """
+
+
+# ---------------------------------------------------------------------------
+# Prose fallback parser — for models that ignore the JSON instruction
+# ---------------------------------------------------------------------------
+def parse_prose_findings(text, rel):
+    """Extract findings from bullet-style prose. Tagged "parsed": "prose"."""
+    bullet_re = re.compile(r"^\s*[-*•]\s+", re.MULTILINE)
+    quote_re = re.compile(r"`([^`]{6,})`")
+    line_re = re.compile(r"[Ll]ine\s+(\d+)")
+
+    results = []
+    segments = bullet_re.split(text)[1:]  # drop preamble before first bullet
+    for body in segments:
+        body = body.strip()
+        if not body:
+            continue
+        finding = {"file": rel, "description": body, "parsed": "prose"}
+        m = quote_re.search(body)
+        if m:
+            finding["quote"] = m.group(1)
+        m = line_re.search(body)
+        if m:
+            finding["line"] = int(m.group(1))
+        results.append(finding)
+    return results
 
 
 # ---------------------------------------------------------------------------
 # Grounding check — strip hallucinated findings
 # ---------------------------------------------------------------------------
-def ground_findings(text, source):
-    bullet_re = re.compile(r"^(\s*[-*•]\s+)", re.MULTILINE)
-    quote_re = re.compile(r"`([^`]{6,})`")
-    segments = bullet_re.split(text)
-    output, kept, dropped = [], 0, 0
+def ground_findings(findings_list, source):
+    """Keep only findings whose quote actually appears in *source*.
 
-    if segments:
-        output.append(segments[0])
-
-    i = 1
-    while i + 1 < len(segments):
-        marker, body = segments[i], segments[i + 1]
-        full = marker + body
-        i += 2
-
-        quotes = quote_re.findall(full)
-        if any(q.strip() in source for q in quotes):
-            output.append(full)
-            kept += 1
+    Comparison is exact substring first, then whitespace-normalized so
+    wrapped quotes survive. Findings without any quote are dropped —
+    an unquotable finding is unverifiable by construction.
+    Returns (kept, dropped_count).
+    """
+    norm_source = fnd.normalize_quote(source)
+    kept, dropped = [], 0
+    for f in findings_list:
+        quote = (f.get("quote") or "").strip()
+        if quote and (quote in source or fnd.normalize_quote(quote) in norm_source):
+            kept.append(f)
         else:
             dropped += 1
-
-    return "".join(output), kept, dropped
+    return kept, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +163,6 @@ class Reviewer:
 
         log(f"  Reviewing {len(all_files)} files with {self.engine.model_for('code')}")
 
-        # Setup reports
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         docs_dir = os.path.join(root, "docs")
         os.makedirs(docs_dir, exist_ok=True)
@@ -141,85 +170,120 @@ class Reviewer:
         layer_dir = os.path.join(docs_dir, "review_by_layer")
         os.makedirs(layer_dir, exist_ok=True)
 
-        stats = {"total": 0, "issues": 0, "clean": 0, "skipped": 0, "grounding_dropped": 0}
-        layer_content = OrderedDict()
+        stats = {"total": 0, "issues": 0, "clean": 0, "skipped": 0,
+                 "grounding_dropped": 0, "dedup_dropped": 0, "errors": 0}
+        coverage = {"full": [], "partial": [], "timeout": [], "skipped": [], "error": []}
+        all_findings = []
         current_layer = None
 
-        with open(report_path, "w", encoding="utf-8") as rpt:
-            rpt.write(f"# {name} — Code Review\n\n**Date**: {ts}  \n")
-            rpt.write(f"**Code model**: `{self.engine.model_for('code')}`  \n\n---\n\n")
+        for i, (rel, layer_key) in enumerate(all_files, 1):
+            if layer_key != current_layer:
+                current_layer = layer_key
+                print(f"\n  {'-'*55}")
+                print(f"  {self.info['layers'].get(layer_key, {}).get('name', layer_key)}")
+                print(f"  {'-'*55}")
 
-            for i, (rel, layer_key) in enumerate(all_files, 1):
-                if layer_key != current_layer:
-                    current_layer = layer_key
-                    layer_content.setdefault(layer_key, [])
-                    print(f"\n  {'-'*55}")
-                    print(f"  {self.info['layers'].get(layer_key, {}).get('name', layer_key)}")
-                    print(f"  {'-'*55}")
+            print(f"    [{i}/{len(all_files)}] {rel}...", end=" ", flush=True)
+            stats["total"] += 1
 
-                print(f"    [{i}/{len(all_files)}] {rel}...", end=" ", flush=True)
-                stats["total"] += 1
+            abs_path = os.path.join(root, rel)
+            code, err = read_file(abs_path)
+            if err:
+                stats["skipped"] += 1
+                coverage["skipped"].append(rel)
+                print(f"SKIP ({err})")
+                continue
+            if not code.strip() or os.path.basename(rel) in ("__init__.py", "conftest.py"):
+                stats["clean"] += 1
+                coverage["skipped"].append(rel)
+                print("SKIP")
+                continue
 
-                abs_path = os.path.join(root, rel)
-                code, err = read_file(abs_path)
-                if err:
-                    stats["skipped"] += 1
-                    print(f"SKIP ({err})")
-                    continue
-                if not code.strip() or os.path.basename(rel) in ("__init__.py", "conftest.py"):
-                    stats["clean"] += 1
-                    print("SKIP")
-                    continue
+            layer_rules = self.rules.get(layer_key, "")
+            if not layer_rules:
+                for rk, rv in self.rules.items():
+                    if layer_key.endswith(rk) or rk.endswith(layer_key.split("/")[-1]):
+                        layer_rules = rv
+                        break
 
-                layer_rules = self.rules.get(layer_key, "")
-                if not layer_rules:
-                    for rk, rv in self.rules.items():
-                        if layer_key.endswith(rk) or rk.endswith(layer_key.split("/")[-1]):
-                            layer_rules = rv
-                            break
+            file_findings, grounding_dropped, status = self._review_file(rel, code, layer_rules)
+            stats["grounding_dropped"] += grounding_dropped
 
-                result, grounding_dropped = self._review_file(rel, code, layer_rules)
-                stats["grounding_dropped"] += grounding_dropped
+            if status == "error":
+                stats["errors"] += 1
+                coverage["error"].append(rel)
+                print("ERROR")
+                continue
 
-                if result is None:
-                    stats["clean"] += 1
-                    print("OK")
-                else:
-                    stats["issues"] += 1
-                    rpt.write(result + "---\n\n")
-                    layer_content[layer_key].append(result)
-                    print("ISSUES")
+            coverage["full"].append(rel)
+            for f in file_findings:
+                f["layer"] = layer_key
+            if file_findings:
+                stats["issues"] += 1
+                all_findings.extend(file_findings)
+                print(f"ISSUES ({len(file_findings)})")
+            else:
+                stats["clean"] += 1
+                print("OK")
 
-            # Summary
-            rpt.write(f"\n---\n\n# Summary\n\n| Metric | Count |\n|---|---|\n")
-            for k, v in stats.items():
-                rpt.write(f"| {k} | {v} |\n")
+        # Dedup (identical findings across chunks/passes)
+        all_findings, dedup_dropped = fnd.dedup_findings(all_findings)
+        stats["dedup_dropped"] = dedup_dropped
 
-        # Per-layer reports
-        for lk, entries in layer_content.items():
-            if entries:
-                lname = self.info["layers"].get(lk, {}).get("name", lk)
-                lpath = os.path.join(layer_dir, f"review_{lk.replace('/', '_')}.md")
-                with open(lpath, "w", encoding="utf-8") as f:
-                    f.write(f"# {lname} — Review\n\n---\n\n")
-                    for e in entries:
-                        f.write(e + "---\n\n")
+        log(f"\n  Pass 1: {stats['issues']} files with issues, {stats['clean']} clean, "
+            f"{stats['skipped']} skipped, {stats['grounding_dropped']} grounding drops, "
+            f"{dedup_dropped} dedup drops")
 
-        log(f"\n  Pass 1: {stats['issues']} issues, {stats['clean']} clean, "
-            f"{stats['skipped']} skipped, {stats['grounding_dropped']} grounding drops")
+        meta = {
+            "project": name,
+            "date": ts,
+            "code_model": self.engine.model_for("code"),
+            "reason_model": self.engine.model_for("reason"),
+        }
+
+        # Pass 2: Consolidation (JSON in, JSON out, validated)
+        health = {}
+        if not skip_consolidation and all_findings:
+            log("\n  Pass 2 — Consolidation (reasoning model)")
+            all_findings, health = self._consolidate(all_findings)
+
+        # Save the source of truth, then render the markdown views from it.
+        json_path = fnd.save_findings(root, fnd.sort_findings(all_findings),
+                                      meta=meta, coverage=coverage, stats=stats)
+        log(f"  Findings JSON: {json_path}")
+
+        data = {"meta": meta, "stats": stats, "coverage": coverage,
+                "findings": all_findings, "health": health}
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(fnd.render_markdown(data, f"{name} — Code Review"))
         log(f"  Report: {report_path}")
 
-        # Pass 2: Consolidation
-        if not skip_consolidation and any(layer_content.values()):
-            log("\n  Pass 2 — Consolidation (reasoning model)")
+        if health or (not skip_consolidation and all_findings):
             con_path = report_path.replace(".md", "_consolidated.md")
-            self._consolidate(layer_content, con_path, ts)
+            with open(con_path, "w", encoding="utf-8") as f:
+                f.write(fnd.render_consolidated(data, f"{name} — Consolidated Review"))
             log(f"  Consolidated: {con_path}")
 
+        # Per-layer views
+        by_layer = OrderedDict()
+        for f in all_findings:
+            by_layer.setdefault(f.get("layer", "other"), []).append(f)
+        for lk, items in by_layer.items():
+            lname = self.info["layers"].get(lk, {}).get("name", lk)
+            lpath = os.path.join(layer_dir, f"review_{lk.replace('/', '_')}.md")
+            ldata = {"meta": {"layer": lname, "date": ts}, "findings": items}
+            with open(lpath, "w", encoding="utf-8") as f:
+                f.write(fnd.render_markdown(ldata, f"{lname} — Review"))
+
         log(f"\n  Total: {fmt_time(time.time() - start)}")
+        return all_findings
 
     def _review_file(self, rel, code, rules):
-        """Review *code*, chunking automatically when it exceeds the model's budget."""
+        """Review *code*, chunking automatically when it exceeds the model's budget.
+
+        Returns (findings_list, grounding_dropped, status) where status is
+        "ok" or "error".
+        """
         budget = self.engine.content_budget("code")
         total_lines = code.count("\n") + 1
 
@@ -231,33 +295,30 @@ class Reviewer:
         chunks = chunk_text(code, budget, overlap=300)
         log(f"    (large file — {len(chunks)} chunks of ~{budget//1000}k chars each)")
 
-        all_bodies = []
+        all_findings = []
         total_dropped = 0
         char_pos = 0
+        had_error = False
 
         for idx, chunk in enumerate(chunks, 1):
             line_start = code[:char_pos].count("\n") + 1
-            chunk_label = f"{rel} [part {idx}/{len(chunks)}]"
-            result, dropped = self._do_review(chunk_label, chunk, rules, full_source=code,
-                                              line_start=line_start, total_lines=total_lines)
+            chunk_findings, dropped, status = self._do_review(
+                rel, chunk, rules, full_source=code,
+                line_start=line_start, total_lines=total_lines)
             total_dropped += dropped
-            if result:
-                # Strip the per-chunk "## `...`" header; we'll add one combined header.
-                body = re.sub(r"^## `[^`\n]+`\n\n", "", result).strip()
-                all_bodies.append(f"*Part {idx}/{len(chunks)} (file lines {line_start}–"
-                                  f"{line_start + chunk.count(chr(10))}):*\n\n{body}")
+            if status == "error":
+                had_error = True
+            for f in chunk_findings:
+                f["chunk_part"] = f"{idx}/{len(chunks)}"
+            all_findings.extend(chunk_findings)
             # Advance past this chunk; overlap means next chunk re-reads last 300 chars.
             char_pos = max(char_pos + len(chunk) - 300, char_pos + 1)
 
-        if not all_bodies:
-            return None, total_dropped
-
-        merged = f"## `{rel}` *(reviewed in {len(chunks)} chunks)*\n\n"
-        merged += "\n\n---\n\n".join(all_bodies) + "\n\n"
-        return merged, total_dropped
+        status = "error" if (had_error and not all_findings) else "ok"
+        return all_findings, total_dropped, status
 
     def _do_review(self, rel, code, rules, full_source, line_start=1, total_lines=None):
-        """Send one code block to the model and return grounded findings."""
+        """Send one code block to the model. Returns (findings, dropped, status)."""
         # When reviewing a chunk, tell the model which part of the file it sees
         # so line numbers in findings are anchored to the full file.
         if total_lines and line_start > 1:
@@ -279,56 +340,102 @@ class Reviewer:
         try:
             reply = self.engine.generate(prompt, role="code")
         except Exception as e:
-            return f"## `{rel}`\n\n**Error**: {e}\n\n", 0
+            log(f"    review failed for {rel}: {e}")
+            return [], 0, "error"
 
-        if not reply or reply.strip() == "OK":
-            return None, 0
+        if not reply or reply.strip() in ("OK", "[]"):
+            return [], 0, "ok"
 
-        lines = reply.splitlines()
-        bullets = sum(1 for l in lines if l.strip().startswith(("-", "*", "•")))
-        if bullets == 0 and len(lines) > 5:
-            return None, 0
+        # Primary path: JSON findings. Fallback: prose bullets.
+        parsed = extract_json(reply)
+        raw_findings = []
+        if isinstance(parsed, list):
+            for obj in parsed:
+                f = fnd.validate_finding(obj, default_file=rel)
+                if f:
+                    f["file"] = rel  # model must not redirect findings elsewhere
+                    f["source"] = "llm"
+                    raw_findings.append(f)
+        elif isinstance(parsed, dict):
+            # Some models wrap the array: {"findings": [...]}
+            for obj in parsed.get("findings", []):
+                f = fnd.validate_finding(obj, default_file=rel)
+                if f:
+                    f["file"] = rel
+                    f["source"] = "llm"
+                    raw_findings.append(f)
+        else:
+            for f in parse_prose_findings(reply, rel):
+                f["source"] = "llm"
+                raw_findings.append(f)
 
         # Ground against the full source so quotes near chunk seams can be verified.
-        grounded, kept, dropped = ground_findings(reply, full_source)
-        if dropped:
-            grounded = grounded.rstrip() + f"\n\n> *Grounding dropped {dropped} unverifiable finding(s).*\n"
-        grounded = grounded.strip()
-        if not grounded or not any(l.strip().startswith(("-","*","•")) for l in grounded.splitlines()):
-            return None, dropped
+        grounded, dropped = ground_findings(raw_findings, full_source)
+        return grounded, dropped, "ok"
 
-        return f"## `{rel}`\n\n{grounded}\n\n", dropped
+    def _consolidate(self, all_findings):
+        """LLM consolidation over the JSON findings, grouped by layer for budget.
 
-    def _consolidate(self, layer_content, output_path, ts):
-        entries = [(k, v) for k, v in layer_content.items() if v]
-        layer_reviews = {}
+        The model must return {"health": ..., "findings": [...]}. The returned
+        schema is validated finding-by-finding; on any validation failure the
+        pre-consolidation findings for that group are kept — consolidation may
+        reduce noise but must never lose data to a malformed reply.
+        Returns (consolidated_findings, health_by_layer).
+        """
+        by_layer = OrderedDict()
+        for f in all_findings:
+            by_layer.setdefault(f.get("layer", "other"), []).append(f)
+
         budget = self.engine.content_budget("reason")
+        consolidated, health = [], {}
 
-        for i, (lk, findings) in enumerate(entries, 1):
+        for i, (lk, group) in enumerate(by_layer.items(), 1):
             lname = self.info["layers"].get(lk, {}).get("name", lk)
-            text = "\n\n---\n\n".join(findings)[:budget]
-            print(f"    [{i}/{len(entries)}] {lname}...", end=" ", flush=True)
+            print(f"    [{i}/{len(by_layer)}] {lname} ({len(group)} findings)...",
+                  end=" ", flush=True)
+            findings_json = json.dumps(group, indent=1, ensure_ascii=False)[:budget]
             try:
-                prompt = CONSOLIDATION_PROMPT.format(findings=text)
-                result = self.engine.generate(prompt, role="reason")
-                layer_reviews[lk] = result or f"### {lname}\nNo output."
-                print("done")
+                reply = self.engine.generate(
+                    CONSOLIDATION_PROMPT.format(findings_json=findings_json),
+                    role="reason")
+                result = extract_json(reply)
             except Exception as e:
-                layer_reviews[lk] = f"### {lname}\nFailed: {e}"
-                print(f"ERROR")
+                print(f"ERROR ({e}) — keeping pre-consolidation findings")
+                consolidated.extend(group)
+                continue
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(f"# {self.info['name']} — Consolidated Review\n\n")
-            f.write(f"**Date**: {ts}  \n**Reason model**: `{self.engine.model_for('reason')}`  \n\n---\n\n")
-            for lk in layer_reviews:
-                f.write(layer_reviews[lk] + "\n\n---\n\n")
+            valid = []
+            if isinstance(result, dict) and isinstance(result.get("findings"), list):
+                for obj in result["findings"]:
+                    f = fnd.validate_finding(obj)
+                    if f is None:
+                        valid = None
+                        break
+                    f.setdefault("layer", lk)
+                    f.setdefault("source", "llm")
+                    valid.append(f)
+            else:
+                valid = None
+
+            if valid is None:
+                print("invalid reply — keeping pre-consolidation findings")
+                consolidated.extend(group)
+            else:
+                # Deterministic findings are never subject to LLM judgment.
+                det = [f for f in group if f.get("source") in ("ruff", "semgrep")]
+                merged, _ = fnd.dedup_findings(det + valid)
+                consolidated.extend(merged)
+                health[lname] = str(result.get("health", "")).strip() or "(no assessment)"
+                print(f"done ({len(group)} -> {len(merged)})")
+
+        return consolidated, health
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Code review with grounding check")
+    parser = argparse.ArgumentParser(description="Code review with structured findings")
     parser.add_argument("--layer", type=str)
     parser.add_argument("--file", type=str)
     parser.add_argument("--skip-consolidation", action="store_true")
