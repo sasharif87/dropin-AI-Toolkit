@@ -113,7 +113,9 @@ def main():
     parser.add_argument("--file", type=str)
     parser.add_argument("--report", type=str)
     parser.add_argument("--timeout", type=int, default=0,
-                        help="Seconds to wait at prompt before auto-proceeding with 'y'")
+                        help="Seconds to wait at prompt before auto-proceeding with the safe default 'n'")
+    parser.add_argument("--yes", action="store_true",
+                        help="Answer 'y' to the apply prompt (intentional unattended apply)")
     parser.add_argument("--ollama-url", type=str, default="http://localhost:11434")
     parser.add_argument("--code-url", type=str, default=None,
                         help="Ollama URL for code role. Defaults to --ollama-url.")
@@ -274,7 +276,8 @@ def main():
 
     if pending:
         log(f"  Preview written to tmp/preview/fixes/ — inspect in IDE before applying.")
-        answer = timed_input("  Apply now? [y/N]:", args.timeout)
+        # Write-gating prompt: timeout defaults to 'n'; --yes is the explicit opt-in.
+        answer = "y" if args.yes else timed_input("  Apply now? [y/N]:", args.timeout)
         if answer == "y":
             for rel, content in pending.items():
                 with open(os.path.join(root, rel), "w", encoding="utf-8") as f:

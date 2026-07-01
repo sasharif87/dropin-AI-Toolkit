@@ -54,6 +54,26 @@ import config
 
 
 # ---------------------------------------------------------------------------
+# Prompt gating
+# ---------------------------------------------------------------------------
+# Prompt call-site audit (all interactive prompts in the toolkit):
+#   drop.py cmd_setup       input()      read-only (config/URLs/model pulls; empty ≠ 'y')
+#   drop.py cmd_develop     apply_prompt WRITE-GATING (source files, tests)
+#   drop.py cmd_test        apply_prompt WRITE-GATING (test files)
+#   drop.py cmd_review      apply_prompt WRITE-GATING (fix may run with --apply)
+#   drop.py cmd_full        apply_prompt WRITE-GATING (source files, tests)
+#   fix.py  main            apply prompt WRITE-GATING (fix apply)
+# All write-gating prompts default to 'n' on timeout (see engine.timed_input)
+# and honour --yes for intentional unattended apply.
+def apply_prompt(args, prompt):
+    """Gate a file-writing action: --yes answers 'y', timeouts default to 'n'."""
+    if getattr(args, "yes", False):
+        log(f"{prompt} y (--yes)")
+        return "y"
+    return timed_input(prompt, args.timeout)
+
+
+# ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 def cmd_setup(args, engine, info, rules):
@@ -220,7 +240,7 @@ def cmd_develop(args, engine, info, rules):
 
     applied = args.apply
     if not args.apply and not args.plan_only and dev.generated:
-        answer = timed_input("\n  Apply source files? [y/N]:", args.timeout)
+        answer = apply_prompt(args, "\n  Apply source files? [y/N]:")
         if answer == "y":
             log("  Applying...")
             dev._write_files()
@@ -234,10 +254,7 @@ def cmd_develop(args, engine, info, rules):
         tgen = TestGenerator(engine, fresh_info, rules)
         tgen.run(apply=False, layer_filter=args.layer)
         if tgen.generated:
-            try:
-                answer = input("\n  Apply tests? [y/N]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                answer = ""
+            answer = apply_prompt(args, "\n  Apply tests? [y/N]:")
             if answer == "y":
                 tgen._write()
 
@@ -250,7 +267,7 @@ def cmd_test(args, engine, info, rules):
             file_filter=args.file, integration=args.integration)
 
     if not args.apply and gen.generated:
-        answer = timed_input("\n  Apply tests? [y/N]:", args.timeout)
+        answer = apply_prompt(args, "\n  Apply tests? [y/N]:")
         if answer == "y":
             gen._write()
 
@@ -262,7 +279,8 @@ def cmd_review(args, engine, info, rules):
     reviewer.run(layer_filter=args.layer, file_filter=args.file,
                  skip_consolidation=args.skip_consolidation)
 
-    answer = timed_input("\n  Run fix now? [y/N]:", args.timeout)
+    # Write-gating when --apply is set (fix subprocess inherits it) — default 'n'.
+    answer = apply_prompt(args, "\n  Run fix now? [y/N]:")
     if answer == "y":
         cmd_fix(args, engine, info, rules)
 
@@ -272,6 +290,7 @@ def cmd_fix(args, engine, info, rules):
     # Delegate to fix.py with forwarded args
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "fix.py")]
     if args.apply: cmd.append("--apply")
+    if getattr(args, "yes", False): cmd.append("--yes")
     if args.layer: cmd.extend(["--layer", args.layer])
     if args.file: cmd.extend(["--file", args.file])
     cmd.extend(["--ollama-url", args.url])
@@ -396,7 +415,7 @@ def cmd_full(args, engine, info, rules):
 
     dev_applied = False
     if not args.plan_only and dev.generated:
-        answer = timed_input("\n  Apply source files? [y/N]:", args.timeout)
+        answer = apply_prompt(args, "\n  Apply source files? [y/N]:")
         if answer == "y":
             dev._write_files()
             dev_applied = True
@@ -414,7 +433,7 @@ def cmd_full(args, engine, info, rules):
     tgen = TestGenerator(engine, fresh_info, rules)
     tgen.run(apply=False, layer_filter=args.layer, integration=args.integration)
     if tgen.generated:
-        answer = timed_input("\n  Apply tests? [y/N]:", args.timeout)
+        answer = apply_prompt(args, "\n  Apply tests? [y/N]:")
         if answer == "y":
             tgen._write()
 
@@ -475,7 +494,10 @@ def main():
     parser.add_argument("--no-llm-rules", action="store_true",
                         help="Skip LLM-based rule generation (pattern rules only)")
     parser.add_argument("--timeout", type=int, default=0,
-                        help="Seconds to wait at each prompt before auto-proceeding with 'y' (0 = wait forever)")
+                        help="Seconds to wait at each prompt before auto-proceeding with the "
+                             "safe default 'n' (0 = wait forever)")
+    parser.add_argument("--yes", action="store_true",
+                        help="Answer 'y' to all apply prompts (intentional unattended apply)")
 
     # Subcommand-specific flags
     parser.add_argument("--plan-only", action="store_true", help="[develop] Just show plan")

@@ -641,8 +641,13 @@ def log(msg):
     print(f"[{ts()}] {msg}")
 
 
-def timed_input(prompt, timeout=0, default="y"):
+def timed_input(prompt, timeout=0, default="n"):
     """Prompt for input. If timeout > 0 and no response arrives, returns default.
+
+    Default is "n": every timed prompt in this toolkit gates a file write, so
+    an unattended timeout must never auto-apply. Pass default="y" only for
+    read-only continuations. Use --yes on the CLI for intentional unattended
+    apply.
 
     Uses platform-native non-blocking I/O (msvcrt on Windows, select on Unix)
     so no background thread is left alive holding stdin after the timeout.
