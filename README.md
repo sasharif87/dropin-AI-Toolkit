@@ -146,6 +146,12 @@ Each gate reads a small config file the consuming repo carries (generalizing the
 python drop.py --url http://remote_host:11434   # point at a remote Ollama host
 ```
 
+Machine-specific addresses (a LAN Ollama box, a non-default port) belong in a
+`.env` at the toolkit root — copy `.env.example` and uncomment what you need.
+`.env` is gitignored and read only from the toolkit's own directory, so host
+details never land in a commit and a repo you validate can't inject one.
+Precedence: CLI flag > `.dropin.json` > `OLLAMA_HOST` (env / `.env`) > localhost.
+
 The engine routes tasks to different local models by complexity — a reasoning
 model for architecture, a code model for generation and fixes, a quick model for
 classification. Pin any of them with `--reason-model` / `--code-model` /

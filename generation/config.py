@@ -3,6 +3,10 @@ config.py — Manages .dropin.json configuration files.
 
 Search order: ./.dropin.json (current dir) then ~/.dropin.json
 No imports from engine, hardware, catalog, or drop — config is a base layer.
+
+Host precedence: CLI flag > .dropin.json > OLLAMA_HOST (env or the toolkit
+root's .env) > localhost. Machine-specific addresses (LAN IPs) belong in the
+gitignored .env — see .env.example — never in committed files.
 """
 
 import json
@@ -12,9 +16,33 @@ import os
 # Defaults
 # ---------------------------------------------------------------------------
 
+def _load_dotenv():
+    """Fill os.environ from the toolkit root's .env (real env vars win).
+
+    Only reads the toolkit's own directory, not the cwd, so a checked-out
+    repo can't inject a host.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        with open(os.path.join(root, ".env"), "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
 DEFAULT_CONFIG = {
     "version": 1,
-    "url": "http://localhost:11434",
+    "url": os.environ.get("OLLAMA_HOST") or "http://localhost:11434",
     "code_url": None,
     "models": {},          # role -> model name, or empty
     "role_ctx_caps": {},   # role -> int, overrides engine.ROLE_CTX_CAPS

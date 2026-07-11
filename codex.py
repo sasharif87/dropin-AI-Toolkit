@@ -13,7 +13,7 @@ actually produced for a given task.
 
 Examples
 --------
-  # free-text task, default model (qwen3-coder:30b) on the homelab box
+  # free-text task, default model (qwen3-coder:30b) on the default host
   python codex.py "Add a healthcheck to the gluetun compose service"
 
   # pull a specific line out of a TODO file as the task
@@ -38,8 +38,34 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_HOST = os.environ.get("CODEX_HOST") or os.environ.get("OLLAMA_HOST") or "http://REDACTED:11434"
-LOCAL_HOST = os.environ.get("CODEX_LOCAL_HOST") or "http://localhost:11434"  # this gaming rig
+def _load_dotenv():
+    """Fill os.environ from the .env next to this script (real env vars win).
+
+    Machine-specific host addresses (LAN IPs, remote Ollama boxes) belong in
+    .env — which is gitignored — never in this file. See .env.example.
+    Only reads the toolkit's own directory, not the cwd, so a checked-out
+    repo can't inject a host.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
+DEFAULT_HOST = os.environ.get("CODEX_HOST") or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+LOCAL_HOST = os.environ.get("CODEX_LOCAL_HOST") or "http://localhost:11434"
 DEFAULT_MODEL = os.environ.get("CODEX_MODEL") or "qwen3-coder:30b"
 DEFAULT_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT", "600"))  # 70B cold loads are slow
 CODER_HINTS = ("coder", "code", "qwen", "deepseek", "starcoder", "codestral")
@@ -90,19 +116,19 @@ def host_reachable(host):
 
 
 def pick_host(explicit, local_only):
-    """Routing: explicit --host wins; else --local forces this rig; else try the
-    homelab server first and fall back to this gaming rig if the server is down."""
+    """Routing: explicit --host wins; else --local forces CODEX_LOCAL_HOST; else
+    try the primary host (CODEX_HOST) first and fall back to the local one."""
     if explicit:
         return explicit
     if local_only:
         return LOCAL_HOST
-    # server first, gaming rig second
+    # primary host first, local fallback second
     if host_reachable(DEFAULT_HOST):
         return DEFAULT_HOST
     if host_reachable(LOCAL_HOST):
-        print(f"[codex] server {DEFAULT_HOST} unreachable, falling back to this rig", file=sys.stderr)
+        print(f"[codex] host {DEFAULT_HOST} unreachable, falling back to {LOCAL_HOST}", file=sys.stderr)
         return LOCAL_HOST
-    print(f"[codex] neither server nor local rig reachable; trying server anyway", file=sys.stderr)
+    print(f"[codex] no configured host reachable; trying {DEFAULT_HOST} anyway", file=sys.stderr)
     return DEFAULT_HOST
 
 
@@ -238,8 +264,8 @@ def main():
     ap.add_argument("--task-file", help="Read the whole task prompt from a file.")
     ap.add_argument("--context", action="append", default=[], help="Existing file to give the model (repeatable).")
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model (default: {DEFAULT_MODEL})")
-    ap.add_argument("--host", default=None, help=f"Force a specific Ollama host (default: server {DEFAULT_HOST}, fall back to this rig)")
-    ap.add_argument("--local", action="store_true", help="Force this gaming rig instead of the homelab server.")
+    ap.add_argument("--host", default=None, help=f"Force a specific Ollama host (default: {DEFAULT_HOST}, falling back to {LOCAL_HOST})")
+    ap.add_argument("--local", action="store_true", help="Force the local host (CODEX_LOCAL_HOST) instead of the primary one.")
     ap.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature (default: 0.2)")
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Request timeout sec (default: {DEFAULT_TIMEOUT})")
     ap.add_argument("--apply", action="store_true", help="Write files into --root instead of the run dir.")
