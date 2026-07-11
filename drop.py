@@ -216,11 +216,20 @@ def cmd_setup(args, engine, info, rules):
 
 def cmd_detect(args, engine, info, rules):
     """Just detect and show what we found."""
+    from orphans import find_orphans, print_orphans
+    from claims import find_claim_issues, print_claims
     print_detection(info)
     print(f"\n  Rules generated for {len(rules)} layers.")
     for key, r in rules.items():
         count = len([l for l in r.split("\n") if l.strip().startswith("-")])
         print(f"    {key:<30} {count:>2} rules")
+
+    # Scaffold-residue check: modules nothing imports with no entry point.
+    print_orphans(find_orphans(info["root"]))
+
+    # Credibility check: doc claims (test counts, LOC) the repo contradicts.
+    print_claims(find_claim_issues(info["root"]))
+
     print(f"\n  Next steps:")
     if info.get("arch_doc"):
         print(f"    python {os.path.basename(__file__)} develop          # scaffold from arch doc")
@@ -230,6 +239,22 @@ def cmd_detect(args, engine, info, rules):
     if info["file_count"] > 0:
         print(f"    python {os.path.basename(__file__)} test             # generate tests")
         print(f"    python {os.path.basename(__file__)} review           # code review")
+    from golden import find_config
+    if find_config(info["root"]):
+        print(f"    python {os.path.basename(__file__)} golden           # golden-file regression gate")
+
+
+def cmd_golden(args):
+    """Golden-file regression gate. Deterministic, local — no Ollama, no rules."""
+    from golden import run_golden, print_golden
+    log("=" * 60)
+    log("  DROP — Golden-File Runner")
+    log("=" * 60)
+    root = os.path.abspath(args.project)
+    result = run_golden(root, config_path=getattr(args, "golden_config", None),
+                        update=getattr(args, "update", False))
+    print_golden(result)
+    sys.exit(0 if result["ok"] else 1)
 
 
 def cmd_develop(args, engine, info, rules):
@@ -291,6 +316,9 @@ def cmd_fix(args, engine, info, rules):
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "fix.py")]
     if args.apply: cmd.append("--apply")
     if getattr(args, "yes", False): cmd.append("--yes")
+    if getattr(args, "batch", False): cmd.append("--batch")
+    if getattr(args, "allow_red_baseline", False): cmd.append("--allow-red-baseline")
+    if getattr(args, "unverified", False): cmd.append("--unverified")
     if args.layer: cmd.extend(["--layer", args.layer])
     if args.file: cmd.extend(["--file", args.file])
     cmd.extend(["--ollama-url", args.url])
@@ -500,16 +528,25 @@ def main():
                         help="Answer 'y' to all apply prompts (intentional unattended apply)")
 
     # Subcommand-specific flags
+    parser.add_argument("--batch", action="store_true",
+                        help="[fix] Verify the whole batch with one suite run instead of per-file")
+    parser.add_argument("--allow-red-baseline", action="store_true",
+                        help="[fix] Proceed even when the baseline test suite already fails")
+    parser.add_argument("--unverified", action="store_true",
+                        help="[fix] Apply fixes even when the test suite can't run")
     parser.add_argument("--plan-only", action="store_true", help="[develop] Just show plan")
     parser.add_argument("--integration", action="store_true", help="[test] Include integration tests")
     parser.add_argument("--skip-consolidation", action="store_true", help="[review] Skip pass 2")
     parser.add_argument("--skip-tests", action="store_true", help="[all] Skip test run phases")
     parser.add_argument("--update", action="store_true",
-                        help="[setup] Re-pull already-installed models to check for updates")
+                        help="[setup] re-pull installed models to check for updates; "
+                             "[golden] re-bank snapshots (accept current output as golden)")
+    parser.add_argument("--golden-config", type=str,
+                        help="[golden] path to golden config (default: <project>/.golden.json)")
 
     parser.add_argument("command", nargs="?", default="detect",
                         choices=["detect", "develop", "test", "review", "fix", "all", "full",
-                                 "setup", "install"],
+                                 "setup", "install", "golden"],
                         help="What to do (default: detect)")
 
     args = parser.parse_args()
@@ -535,6 +572,13 @@ def main():
     if cfg.get("catalog_url"):
         import catalog as _cat_mod
         _cat_mod.CATALOG_URL = cfg["catalog_url"]
+
+    # ── Air-gapped gates: run before touching Ollama ──
+    # The golden-file runner is deterministic and local (sovereignty constraint) —
+    # it must work with no Ollama reachable, so it dispatches before engine setup.
+    if args.command == "golden":
+        cmd_golden(args)
+        return
 
     # ── Setup engine ──
     # Start from config-defined model pins, then let explicit CLI flags override.

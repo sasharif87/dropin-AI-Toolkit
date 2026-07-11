@@ -18,10 +18,12 @@ Usage (stdio transport — add to Claude Code MCP config):
     python mcp_server.py
 """
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import threading
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -39,10 +41,62 @@ mcp = FastMCP("dropin")
 
 DROP_SCRIPT = os.path.join(SCRIPT_DIR, "drop.py")
 
+_VALID_ROLES = {"code", "reason", "quick"}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _stdout_to_stderr():
+    """Redirect stdout to stderr for the duration of the block.
+
+    In-process tool calls run engine/detect/rules code that prints progress
+    to stdout.  MCP stdio transport uses stdout for JSON-RPC framing, so any
+    stray print() corrupts the connection.  This redirects it safely.
+    """
+    old = sys.stdout
+    sys.stdout = sys.stderr
+    try:
+        yield
+    finally:
+        sys.stdout = old
+
+
+# Module-level engine cache — rebuilt only when the config file changes.
+_engine_lock = threading.Lock()
+_engine_cache: dict = {"engine": None, "key": None}
+
+
+def _get_engine():
+    """Return a connected Engine, reusing the cached instance when config is unchanged."""
+    cfg_path = config.config_path()
+    try:
+        mtime = os.path.getmtime(cfg_path) if cfg_path else None
+    except OSError:
+        mtime = None
+    cache_key = (cfg_path, mtime)
+
+    with _engine_lock:
+        if _engine_cache["engine"] is None or _engine_cache["key"] != cache_key:
+            from engine import Engine
+            cfg = config.load()
+            eng = Engine(
+                url=cfg.get("url", "http://localhost:11434"),
+                code_url=cfg.get("code_url"),
+                models=cfg.get("models", {}),
+                role_ctx_caps=cfg.get("role_ctx_caps") or {},
+            )
+            with _stdout_to_stderr():
+                ok, _, msg = eng.test()
+            if not ok:
+                raise RuntimeError(f"Cannot reach Ollama: {msg}")
+            _engine_cache["engine"] = eng
+            _engine_cache["key"] = cache_key
+
+    return _engine_cache["engine"]
+
 
 def _base_cmd(cfg, project_dir, command):
     """Build the base drop.py subprocess command."""
@@ -55,37 +109,33 @@ def _base_cmd(cfg, project_dir, command):
 
 
 def _run(cmd):
-    """Run a drop.py command, capturing all output. stdin is closed so
-    interactive prompts auto-fail (empty string → not 'y' → no accidental apply)."""
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdin=subprocess.DEVNULL,
-        cwd=SCRIPT_DIR,
-    )
+    """Run a drop.py command, capturing all output.
+
+    stdin is closed so interactive prompts auto-fail (empty string → not 'y'
+    → no accidental apply).  Raises RuntimeError on non-zero exit or timeout.
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            cwd=SCRIPT_DIR,
+            timeout=3600,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("drop.py timed out after 1 hour")
+
     out = (result.stdout or "").strip()
     err = (result.stderr or "").strip()
-    combined = out + ("\n" + err if err else "")
-    return combined.strip()
+    combined = (out + ("\n" + err if err else "")).strip()
 
+    if result.returncode != 0:
+        raise RuntimeError(combined or f"drop.py exited with code {result.returncode}")
 
-def _engine():
-    """Return a connected Engine using the active config."""
-    from engine import Engine
-    cfg = config.load()
-    engine = Engine(
-        url=cfg.get("url", "http://localhost:11434"),
-        code_url=cfg.get("code_url"),
-        models=cfg.get("models", {}),
-        role_ctx_caps=cfg.get("role_ctx_caps") or {},
-    )
-    ok, _, msg = engine.test()
-    if not ok:
-        raise RuntimeError(f"Cannot reach Ollama: {msg}")
-    return engine
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -99,26 +149,30 @@ def dropin_detect(project_dir: str) -> str:
     Returns JSON with name, stack, layers (file counts + patterns), arch_doc path,
     and total file count. Use this first to understand what you're working with.
     """
-    from detect import detect
-    abs_dir = os.path.abspath(project_dir)
-    info = detect(abs_dir)
-    return json.dumps({
-        "name": info["name"],
-        "root": info["root"],
-        "stack": info["stack"],
-        "arch_doc": info["arch_doc"],
-        "has_tests": info["has_tests"],
-        "file_count": info["file_count"],
-        "layers": {
-            k: {
-                "file_count": v["file_count"],
-                "patterns": v["patterns"],
-                "files": v["files"],
-            }
-            for k, v in info["layers"].items()
-        },
-        "config_files": info["config_files"],
-    }, indent=2)
+    try:
+        from detect import detect
+        abs_dir = os.path.abspath(project_dir)
+        with _stdout_to_stderr():
+            info = detect(abs_dir)
+        return json.dumps({
+            "name": info["name"],
+            "root": info["root"],
+            "stack": info["stack"],
+            "arch_doc": info["arch_doc"],
+            "has_tests": info["has_tests"],
+            "file_count": info["file_count"],
+            "layers": {
+                k: {
+                    "file_count": v["file_count"],
+                    "patterns": v["patterns"],
+                    "files": v["files"],
+                }
+                for k, v in info["layers"].items()
+            },
+            "config_files": info["config_files"],
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
@@ -129,29 +183,30 @@ def dropin_rules(project_dir: str) -> str:
     generates them from detected patterns + architecture doc (requires Ollama).
     Returns JSON mapping layer key -> rule text.
     """
-    from detect import detect
-    from rules import load_rules, build_all_rules
-
-    abs_dir = os.path.abspath(project_dir)
-    rules_path = os.path.join(abs_dir, "docs", ".layer_rules.json")
-
-    if os.path.isfile(rules_path):
-        rules = load_rules(rules_path)
-        return json.dumps({"source": "cached", "path": rules_path, "rules": rules}, indent=2)
-
-    info = detect(abs_dir)
     try:
-        engine = _engine()
-    except RuntimeError as e:
-        return json.dumps({"error": str(e)})
+        from detect import detect
+        from rules import load_rules, build_all_rules
 
-    use_llm = bool(info.get("arch_doc"))
-    rules, _ = build_all_rules(engine, info, use_llm=use_llm)
-    return json.dumps({"source": "generated", "rules": rules}, indent=2)
+        abs_dir = os.path.abspath(project_dir)
+        rules_path = os.path.join(abs_dir, "docs", ".layer_rules.json")
+
+        if os.path.isfile(rules_path):
+            rules = load_rules(rules_path)
+            return json.dumps({"source": "cached", "path": rules_path, "rules": rules}, indent=2)
+
+        with _stdout_to_stderr():
+            info = detect(abs_dir)
+            engine = _get_engine()
+            use_llm = bool(info.get("arch_doc"))
+            rules, _ = build_all_rules(engine, info, use_llm=use_llm)
+
+        return json.dumps({"source": "generated", "rules": rules}, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
-def dropin_generate(prompt: str, role: str = "code", project_dir: str = "") -> str:
+def dropin_generate(prompt: str, role: str = "code") -> str:
     """Send a prompt directly to local Ollama and return the raw response.
 
     role: 'code' (generation/fixes), 'reason' (architecture/analysis),
@@ -159,12 +214,12 @@ def dropin_generate(prompt: str, role: str = "code", project_dir: str = "") -> s
     Use this for surgical one-off generation — e.g. regenerating a single file
     or asking the local model to explain a finding.
     """
+    if role not in _VALID_ROLES:
+        return f"ERROR: role must be one of {sorted(_VALID_ROLES)}, got '{role}'"
     try:
-        engine = _engine()
-    except RuntimeError as e:
-        return f"ERROR: {e}"
-    try:
-        return engine.generate(prompt, role=role)
+        engine = _get_engine()
+        with _stdout_to_stderr():
+            return engine.generate(prompt, role=role)
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -199,13 +254,13 @@ def dropin_develop(
 def dropin_review(
     project_dir: str,
     layer: str = "",
-    file: str = "",
+    file_path: str = "",
     skip_consolidation: bool = False,
 ) -> str:
     """Run a layer-aware code review with grounding check.
 
     layer              — target specific layers (comma-separated). Empty = all.
-    file               — target a single file path (relative to project_dir).
+    file_path          — target a single file path (relative to project_dir).
     skip_consolidation — skip the reasoning-model consolidation pass (faster).
 
     Report is written to docs/code_review_report.md and
@@ -216,8 +271,8 @@ def dropin_review(
     cmd = _base_cmd(cfg, project_dir, "review")
     if layer:
         cmd += ["--layer", layer]
-    if file:
-        cmd += ["--file", file]
+    if file_path:
+        cmd += ["--file", file_path]
     if skip_consolidation:
         cmd.append("--skip-consolidation")
     return _run(cmd)
@@ -227,7 +282,7 @@ def dropin_review(
 def dropin_fix(
     project_dir: str,
     layer: str = "",
-    file: str = "",
+    file_path: str = "",
     apply: bool = False,
 ) -> str:
     """Apply fixes from the last review report.
@@ -236,16 +291,16 @@ def dropin_fix(
     Validates fixes before applying: syntax check, size ratio, public API
     preservation, comment retention.
 
-    layer  — only fix files in these layers.
-    file   — only fix this specific file.
-    apply  — write fixes to disk. False = preview in tmp/preview/fixes/.
+    layer     — only fix files in these layers.
+    file_path — only fix this specific file.
+    apply     — write fixes to disk. False = preview in tmp/preview/fixes/.
     """
     cfg = config.load()
     cmd = _base_cmd(cfg, project_dir, "fix")
     if layer:
         cmd += ["--layer", layer]
-    if file:
-        cmd += ["--file", file]
+    if file_path:
+        cmd += ["--file", file_path]
     if apply:
         cmd.append("--apply")
     return _run(cmd)
@@ -255,7 +310,7 @@ def dropin_fix(
 def dropin_test(
     project_dir: str,
     layer: str = "",
-    file: str = "",
+    file_path: str = "",
     apply: bool = False,
     integration: bool = False,
 ) -> str:
@@ -265,7 +320,7 @@ def dropin_test(
     Generates a conftest.py with shared fixtures.
 
     layer       — target specific layers.
-    file        — target a single source file.
+    file_path   — target a single source file.
     apply       — write test files to disk.
     integration — include integration tests (marked @pytest.mark.integration).
     """
@@ -273,8 +328,8 @@ def dropin_test(
     cmd = _base_cmd(cfg, project_dir, "test")
     if layer:
         cmd += ["--layer", layer]
-    if file:
-        cmd += ["--file", file]
+    if file_path:
+        cmd += ["--file", file_path]
     if apply:
         cmd.append("--apply")
     if integration:

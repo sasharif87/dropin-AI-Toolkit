@@ -24,6 +24,7 @@ from datetime import datetime
 from engine import Engine, strip_fences, read_file, log, timed_input
 import config
 import findings as fnd
+from testgate import TestGate
 
 # ---------------------------------------------------------------------------
 # Fix prompt
@@ -144,6 +145,121 @@ def _syntax_check_py(content):
 
 
 # ---------------------------------------------------------------------------
+# Test gate — semantic verification around every applied fix
+# ---------------------------------------------------------------------------
+def _init_gate(root, args):
+    """Set up the test gate and run the baseline suite.
+
+    Returns (gate, gate_active). gate=None means applying is blocked —
+    the caller must not write any fix. gate_active=False means the user
+    explicitly opted into unverified application (--unverified).
+    """
+    from detect import detect
+    info = detect(root)
+    gate = TestGate(root, info["stack"], info.get("has_tests"))
+
+    ok, reason = gate.available()
+    if not ok:
+        log(f"  !! TEST GATE UNAVAILABLE — {reason}. Fixes cannot be verified.")
+        if not args.unverified:
+            log("  Refusing to apply unverified fixes. Re-run with --unverified to override.")
+            return None, False
+        log("  --unverified set — applying WITHOUT test verification.")
+        return gate, False
+
+    log(f"  Test gate: running baseline suite ({gate.framework})...")
+    status, failed = gate.baseline()
+    if status in ("unavailable", "no_tests"):
+        log(f"  !! TEST GATE UNAVAILABLE — suite could not run ({status}). "
+            f"Fixes cannot be verified.")
+        if not args.unverified:
+            log("  Refusing to apply unverified fixes. Re-run with --unverified to override.")
+            return None, False
+        log("  --unverified set — applying WITHOUT test verification.")
+        return gate, False
+    if status == "fail" and not args.allow_red_baseline:
+        log(f"  !! Baseline is RED ({len(failed)} failing test(s)).")
+        log("  Re-run with --allow-red-baseline to proceed — new regressions will be "
+            "compared against the existing failure set.")
+        return None, False
+    return gate, True
+
+
+def _reject_findings(root, file_findings):
+    """Mark findings as rejected by the test gate and persist to the ledger."""
+    for f in file_findings:
+        f["fix_rejected"] = "test_regression"
+    if file_findings:
+        fnd.update_findings(root, file_findings)
+
+
+def _apply_one(root, rel, original, fixed, gate, gate_active, file_findings):
+    """Write one fix and verify it against the affected tests.
+
+    Any new failure reverts the file to the original and marks the findings
+    "fix_rejected": "test_regression" in review_findings.json — a failing
+    fix is never left applied. Returns (applied, note).
+    """
+    abs_path = os.path.join(root, rel)
+    with open(abs_path, "w", encoding="utf-8") as f:
+        f.write(fixed)
+    if not gate_active:
+        return True, "applied (UNVERIFIED)"
+
+    targets = gate.affected_tests(rel)
+    scope = f"{len(targets)} affected test file(s)" if targets else "full suite (uncertain)"
+    status, failed, _out = gate.run(targets)
+    if status == "no_tests":
+        # Subset matched nothing runnable — fall back to the full suite.
+        status, failed, _out = gate.run()
+        scope = "full suite (subset empty)"
+
+    new = gate.new_failures(failed) if status == "fail" else set()
+    if new:
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(original)
+        _reject_findings(root, file_findings)
+        shown = ", ".join(sorted(new)[:3])
+        return False, f"REVERTED — new failure(s): {shown}"
+    return True, f"verified ({scope})"
+
+
+def _apply_pending(root, pending, gate, gate_active, batch):
+    """Apply all pending fixes. Per-file gating by default; --batch runs the
+    suite once after all writes and reverts the whole batch on regression
+    (per-file attribution is impossible after a batch write).
+    Returns (applied_count, reverted_count).
+    """
+    if batch and gate_active:
+        for rel, (_orig, fixed, _ffs) in pending.items():
+            with open(os.path.join(root, rel), "w", encoding="utf-8") as f:
+                f.write(fixed)
+        log(f"  Batch applied {len(pending)} file(s) — running full suite once...")
+        status, failed, _out = gate.run(first_fail_stop=False)
+        new = gate.new_failures(failed) if status == "fail" else set()
+        if new:
+            log(f"  !! Batch introduced {len(new)} new failure(s) — reverting entire batch.")
+            all_ffs = []
+            for rel, (orig, _fixed, ffs) in pending.items():
+                with open(os.path.join(root, rel), "w", encoding="utf-8") as f:
+                    f.write(orig)
+                all_ffs.extend(ffs)
+            _reject_findings(root, all_ffs)
+            return 0, len(pending)
+        return len(pending), 0
+
+    applied = reverted = 0
+    for rel, (orig, fixed, ffs) in pending.items():
+        ok, note = _apply_one(root, rel, orig, fixed, gate, gate_active, ffs)
+        print(f"    {rel}: {note}")
+        if ok:
+            applied += 1
+        else:
+            reverted += 1
+    return applied, reverted
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -158,6 +274,13 @@ def main():
                         help="Seconds to wait at prompt before auto-proceeding with the safe default 'n'")
     parser.add_argument("--yes", action="store_true",
                         help="Answer 'y' to the apply prompt (intentional unattended apply)")
+    parser.add_argument("--batch", action="store_true",
+                        help="Verify the whole batch with one suite run instead of per-file "
+                             "(reverts the entire batch on any new failure)")
+    parser.add_argument("--allow-red-baseline", action="store_true",
+                        help="Proceed even when the baseline test suite already fails")
+    parser.add_argument("--unverified", action="store_true",
+                        help="Apply fixes even when the test suite can't run (NOT recommended)")
     parser.add_argument("--ollama-url", type=str, default="http://localhost:11434")
     parser.add_argument("--code-url", type=str, default=None,
                         help="Ollama URL for code role. Defaults to --ollama-url.")
@@ -216,7 +339,7 @@ def main():
     patch_path = os.path.join(patch_dir, f"fixes_{ts}.patch")
 
     stats = {"fixed": 0, "no_change": 0, "skipped": 0, "errors": 0}
-    pending = {}  # rel → fixed content, for apply-after-preview
+    pending = OrderedDict()  # rel → (original, fixed, findings); applied after the gate
 
     with open(patch_path, "w", encoding="utf-8") as pf:
         pf.write(f"# Fix patches — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
@@ -298,39 +421,48 @@ def main():
             diff_text = "".join(diff)
             pf.write(diff_text + "\n")
             stats["fixed"] += 1
+            pending[rel] = (original, fixed, file_findings)
 
-            if args.apply:
-                with open(abs_path, "w", encoding="utf-8") as f:
-                    f.write(fixed)
-                print(f"FIXED ({len(diff)} diff lines)")
-            else:
+            if not args.apply:
                 preview_path = os.path.join(root, "tmp", "preview", "fixes",
                                             rel.replace("/", os.sep))
                 os.makedirs(os.path.dirname(preview_path), exist_ok=True)
                 with open(preview_path, "w", encoding="utf-8") as pf2:
                     pf2.write(fixed)
-                pending[rel] = fixed
-                print(f"PENDING ({len(diff)} diff lines)")
+            print(f"READY ({len(diff)} diff lines)")
 
     if stats["fixed"] == 0 and os.path.isfile(patch_path):
         os.remove(patch_path)
 
-    log(f"\n  Fixed: {stats['fixed']} | No change: {stats['no_change']} | "
+    log(f"\n  Fixes ready: {stats['fixed']} | No change: {stats['no_change']} | "
         f"Skipped: {stats['skipped']} | Errors: {stats['errors']}")
 
-    if pending:
+    if not pending:
+        return
+
+    do_apply = args.apply
+    if not do_apply:
         log(f"  Preview written to tmp/preview/fixes/ — inspect in IDE before applying.")
         # Write-gating prompt: timeout defaults to 'n'; --yes is the explicit opt-in.
         answer = "y" if args.yes else timed_input("  Apply now? [y/N]:", args.timeout)
-        if answer == "y":
-            for rel, content in pending.items():
-                with open(os.path.join(root, rel), "w", encoding="utf-8") as f:
-                    f.write(content)
-            log(f"  Applied {len(pending)} fixes.")
-        else:
-            log(f"  Skipped — re-run with --apply to write.")
-    elif not args.apply and stats["fixed"]:
-        log(f"  Review patches in {patch_dir}/, then --apply")
+        do_apply = answer == "y"
+        if not do_apply:
+            log(f"  Skipped — review patches in {patch_dir}/, then --apply")
+            return
+
+    # ── Test gate: baseline before any write, verify after each ─────────────
+    gate, gate_active = _init_gate(root, args)
+    if gate is None:
+        log("  No fixes applied.")
+        return
+
+    applied, reverted = _apply_pending(root, pending, gate, gate_active, args.batch)
+    summary = f"  Applied: {applied}"
+    if reverted:
+        summary += f" | Reverted (test regression): {reverted}"
+    if not gate_active:
+        summary += " | UNVERIFIED — no test gate"
+    log(summary)
 
 
 if __name__ == "__main__":

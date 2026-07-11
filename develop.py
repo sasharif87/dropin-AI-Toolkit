@@ -256,6 +256,12 @@ class Developer:
         log("Phase 3 — Generating package init files")
         self._generate_inits()
 
+        # Phase 3b: Emit deterministic wiring-test stubs (no LLM) so Potemkin
+        # routes — 200-OK handlers wired to nothing — fail fast instead of
+        # surviving until someone relies on the data.
+        log("Phase 3b — Emitting wiring-test stubs")
+        self._generate_wiring_tests()
+
         # Phase 4: Generate config files
         log("Phase 4 — Generating config files")
         self._generate_configs()
@@ -452,6 +458,26 @@ class Developer:
 
         if dirs_needing_init:
             log(f"  Added {len(dirs_needing_init)} __init__.py files")
+
+    def _generate_wiring_tests(self):
+        """Deterministically emit wiring-test stubs for scaffolded routes/modules.
+
+        Built from the plan's structured routes/file specs (no LLM), and only
+        for files actually generated this run. Existing files are never
+        overwritten here — `_write_files` still skips anything already on disk.
+        """
+        from wiring import build_wiring_tests
+        lang = self.info["stack"].get("backend", "python")
+        tests_dir = self.info.get("has_tests") or "tests"
+        stubs = build_wiring_tests(self.plan, generated_paths=set(self.generated),
+                                   tests_dir=tests_dir, lang=lang)
+        added = 0
+        for path, content in stubs.items():
+            if path not in self.generated:
+                self.generated[path] = content
+                added += 1
+        if added:
+            log(f"  Emitted {added} wiring-test stub file(s) under {tests_dir}/wiring/")
 
     def _generate_configs(self):
         configs = self.plan.get("config_files", [])
