@@ -71,14 +71,91 @@ Tasks, roughly in leverage order:
       Follow-ups deferred: `deployed`/`in production`/coverage-% claims (not
       statically re-derivable — would need a runner or deploy probe); emitting into
       the findings JSON ledger (parity with `orphans.py`, which also only prints).
-- [ ] **Extract IME's gates into the toolkit**: parameterize `check_invariants.py` /
-      `check_layers.py` behind per-project config so homeForge and the training app
-      get IME-grade gating for free.
-- [ ] **Wire local triggers**: pre-commit hook template + CI snippet that run the fast
-      gates automatically; full gate set on push. Enforcement stops depending on memory.
-- [ ] **Invert the CLI**: validation is the default path (`drop.py` → gates + findings),
-      generation is opt-in. Mostly rearrangement of existing code, least urgent —
-      do after the two new gate types exist.
+- [x] **Extract IME's layer gate** (Gate A) (2026-07-11): `layers.py` ports IME's
+      `scripts/check_layers.py` behind a per-repo `.layers.json`, so homeForge and the
+      training app get IME-grade layer gating without a bespoke script. Two deterministic
+      checks (no Ollama, `ast` only): **no upward imports** — a configured `top_layer` (e.g.
+      the API/route layer) may not be imported by any module below it — and **layer-map
+      completeness** — every package under `source_root` must have an entry in the
+      `.layer_rules.json` map. The four IME hardcodes (source root, top layer, non-layer
+      exclusions, rules-map path) all became config keys; `from pkg import layer` is caught,
+      not only `import pkg.layer`. New subcommand `drop.py layers`, dispatched air-gapped
+      before engine setup (sovereignty constraint) like `golden`. Fail-closed throughout: a
+      configured gate with a missing source root or rules map fails, an unparseable source
+      file is a *surfaced error* (never a silent skip), and a repo with no `.layers.json`
+      opts out. Covered by `tests/test_layers.py` (20 hermetic temp-repo cases).
+      Python package layout only (matches orphans/wiring/claims). The reference source was
+      staged in `_ime_ref/` (gitignored) — folder-scoped so the port never had to open the
+      IME repo root; deleted once Gate B landed (see below). Follow-ups deferred: resolving
+      relative imports against a package root; multiple/tiered top layers; emitting
+      violations into the findings JSON ledger.
+- [x] **Extract IME's invariant harness** (Gate B) (2026-07-11): `invariants.py` ports IME's
+      `scripts/check_invariants.py` *scaffolding* as a **pluggable-check harness**. Unlike the
+      declarative layer gate (a repo ships a `.layers.json` the toolkit reads), invariant checks
+      are *code, not config* — "this except-block must fail closed", "this column must never
+      exist on that model" — so the toolkit ships the machinery and each repo ships the checks:
+      the `Invariant` model with `ENFORCED`/`GAP` states, a `Repo` of cheap AST/text helpers
+      (`read`/`parse`/`function_source`/`except_body_source`/`has_required_str_param`/
+      `iter_py`/`iter_lines` — the ported lines 44–104), a fail-closed importlib loader, and a
+      runner (the ported registry/runner 317–392). A consuming repo writes a `.invariants.py`
+      that does `from invariants import Invariant, ENFORCED, GAP` and defines `check(repo)`
+      functions plus a module-level `INVARIANTS` list; IME's 17 `check_N_*` functions stay in
+      IME as the reference example (never ported). New subcommand `drop.py invariants`,
+      dispatched air-gapped before engine setup (sovereignty constraint) like `golden`/`layers`.
+      Fail-closed throughout: a missing/opt-out `.invariants.py` passes with a note, but a syntax
+      error, a missing `INVARIANTS` list, an `ENFORCED` entry with no callable check, an unknown
+      status, a check that *raises*, and a check returning a non-list are all *surfaced errors*
+      that fail the gate (a broken check can never hide a real violation). Deterministic, local,
+      no Ollama (`ast` + text only). Covered by `tests/test_invariants.py` (24 hermetic temp-repo
+      cases: happy path, each failure/error class, gaps-never-fail, opt-out, and direct `Repo`
+      helper unit tests). With Gate B landed the reference `_ime_ref/` was deleted (both gates
+      ported). Follow-ups deferred: emitting violations into the findings JSON ledger (parity
+      with orphans/claims, which also only print); a `--only <id>` filter.
+- [x] **Wire local triggers** (2026-07-11): `triggers.py` + `drop.py hooks` install the
+      fast, air-gapped, fail-closed gates (`layers`, `invariants`, `golden`) as a **pre-commit
+      hook**, so enforcement stops depending on memory (the "event-driven" property from the
+      reframe). The hook is a POSIX `sh` script (runs under Git for Windows too) with the
+      interpreter + `drop.py` path baked in at install time; it runs each gate *only* if that
+      gate's config is present (`.layers.json` / `.invariants.py` / `.golden.json`), so an
+      unconfigured repo sees no noise and the same hook is safe to install everywhere. Verified
+      end-to-end: a failing gate blocks the commit (exit 1, clear message), `DROPIN_SKIP=1`
+      bypasses once, a fixed gate passes, and Windows backslash paths execute fine under Git
+      Bash. Fail-closed install: a foreign existing hook is backed up (not clobbered) only with
+      `--force`, a prior dropin hook is refreshed in place (idempotent), and a non-git dir is an
+      error. `drop.py hooks --ci` also emits a `.github/workflows/dropin-gates.yml` running the
+      three gates (honest about the one deployment choice it can't make: how a consuming repo's
+      CI gets `drop.py` on disk — checkout vs vendor). Deterministic, local, no Ollama (dispatched
+      air-gapped before engine setup like the gates it installs). Covered by
+      `tests/test_triggers.py` (14 hermetic cases: render/substitution, install/backup/refresh,
+      worktree `gitdir:` pointer, CI write, aggregate ok). **Own house:** the toolkit now dogfoods
+      its own enforcement via `.github/workflows/ci.yml` — the full unittest suite plus the three
+      gates pointed at itself (they opt out cleanly, proving the wiring). The advisory reports
+      (orphans/claims via `detect`) stay *out* of the blocking path: they're print-only by design
+      (false-negative bias) and `detect` needs the engine, so they don't belong in an air-gapped
+      commit hook. Follow-ups deferred: a pre-push hook for a slower/full set; surfacing the
+      orphans/claims residue report in CI via an air-gapped entry point.
+- [x] **Invert the CLI** (2026-07-11): `validate.py` + `drop.py validate` make validation
+      the **default** path — `drop.py` with no command now runs the gates + advisory
+      reports (the "gates + findings" destination of this section), and generation
+      (`develop`/`test`/`review`/`fix`) is opt-in. `validate` aggregates the three
+      deterministic gates (`layers`, `invariants`, `golden`) via their `run_*` functions and
+      the advisory finders (`orphans`, `claims`, plus a one-line summary of the last review's
+      `docs/review_findings.json` ledger) into one verdict. The aggregate `ok` is the **AND of
+      the blocking gates only** — advisory reports print but never flip the verdict (same
+      false-negative-biased split `triggers.py` already draws for the commit hook). Dispatched
+      air-gapped before engine setup (sovereignty constraint) like the gates it wraps, so the
+      toolkit's own front door needs no Ollama and no network. Fail-closed inheritance: each
+      gate opts out cleanly when unconfigured, a *configured* gate that can't run fails, and a
+      repo with zero gates validates green but the output loudly says "nothing is enforced"
+      (a gate pack that enforces nothing is the anti-pattern, not a pass to celebrate). The
+      one behavioral change is the default command (`detect` → `validate`); `detect` stays as
+      the Ollama-coupled project overview. Covered by `tests/test_validate.py` (19 hermetic
+      cases: opt-out, each gate wired/failing, one-bad-gate-fails-the-aggregate, advisories
+      never block, findings summary present/absent, explicit config paths, and print
+      rendering for pass/fail/no-config). README rewritten around the validation-first framing
+      (the two halves, the gate pack table, wiring gates to fire). Follow-ups deferred:
+      folding the advisory residue into a machine-readable findings JSON (parity with the
+      review ledger); `mcp_server.py` exposing `validate` as the local bridge for any consumer.
 
 ## Highest leverage — catch scaffold residue at scaffold time
 
@@ -117,7 +194,7 @@ Tasks, roughly in leverage order:
 - [x] **Toolkit test suite** — the tool that refuses to apply unverified fixes to other
       repos now has tests of its own (2026-07-10). Stdlib `unittest` only, so the suite
       runs on the same bare air-gapped Python as the toolkit — no pytest dependency.
-      Run: `python -m unittest discover -s tests`. **199 tests**, all green. Coverage of
+      Run: `python -m unittest discover -s tests`. **257 tests**, all green. Coverage of
       every silent-failure surface the audit named:
         - `testgate.py` status parsing (pass/fail/no_tests/unavailable + failure-line
           regexes + affected-test heuristic), subprocess stubbed
@@ -128,4 +205,5 @@ Tasks, roughly in leverage order:
           pinned so a wrong-kwarg regression fails loudly), network stubbed
         - `hardware.py` `detect_gpu` / `installed_models` / `pull_model` broad-except
           probes + nvidia-smi parsing + the "never raises" contract, subprocess/HTTP stubbed
-        - the new `orphans.py`, `claims.py`, `golden.py`, and `wiring.py` gates
+        - the new `orphans.py`, `claims.py`, `golden.py`, `wiring.py`, `layers.py`, and
+          `invariants.py` gates, plus `triggers.py` (the pre-commit/CI installer)

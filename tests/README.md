@@ -12,7 +12,7 @@ Run from the repo root:
 python -m unittest discover -s tests
 ```
 
-Coverage today (the silent-failure surfaces named in the TODO) — 199 tests:
+Coverage today (the silent-failure surfaces named in the TODO) — 281 tests:
 
 - `test_orphans.py`  — zero-caller / scaffold-residue detection (`orphans.py`)
 - `test_claims.py`   — doc-claim checker: re-derive test counts / LOC from the
@@ -21,6 +21,17 @@ Coverage today (the silent-failure surfaces named in the TODO) — 199 tests:
 - `test_golden.py`   — golden-file runner: bank known-good output for real input
                         fixtures and diff on change; fail-closed on missing
                         golden or zero-match glob (`golden.py`)
+- `test_layers.py`   — architectural layer gate: no upward imports into the top
+                        layer + layer-map completeness, config-driven and
+                        fail-closed (`layers.py`)
+- `test_invariants.py` — pluggable design-invariant harness: ENFORCED/GAP states,
+                        fail-closed loader/runner, each error class surfaced
+                        (`invariants.py`)
+- `test_triggers.py` — local trigger installer: pre-commit hook render/install/
+                        backup/refresh and the CI workflow (`triggers.py`)
+- `test_validate.py` — the default path: the aggregate `ok` is the AND of the
+                        blocking gates, and orphans/claims/findings stay advisory
+                        (never flip the verdict) (`validate.py`)
 - `test_wiring.py`   — wiring-test stub emitter: deterministic pytest stubs for
                         scaffolded routes/modules, compile-verified and ASCII;
                         the `*_unverified` tripwire fails until wiring is

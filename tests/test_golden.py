@@ -188,6 +188,16 @@ class ConfigTests(unittest.TestCase):
         p = os.path.join(self.root, "custom.json")
         self.assertEqual(find_config(self.root, p), p)
 
+    def test_missing_explicit_config_fails_closed(self):
+        # An explicitly requested config that doesn't exist is a surfaced
+        # failure — a typo'd --golden-config must never go silently green.
+        # Only auto-discovery finding nothing is an opt-out.
+        missing = os.path.join(self.root, "typo.golden.json")
+        result = run_golden(self.root, config_path=missing)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["config"], missing)
+        self.assertIn("not found", result["note"])
+
     def test_malformed_json_fails_closed(self):
         _write(self.root, ".golden.json", "{not json")
         result = run_golden(self.root)

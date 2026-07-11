@@ -14,7 +14,8 @@ Model switching happens automatically:
   - Quick model for classification and yes/no decisions
 
 Usage:
-    python drop.py                             # detect + show plan
+    python drop.py                             # validate: gates + advisory reports (air-gapped)
+    python drop.py detect                      # detect + show plan (needs Ollama)
     python drop.py develop                     # scaffold from arch doc
     python drop.py develop --apply             # write scaffolded files
     python drop.py test                        # generate test suites
@@ -244,6 +245,27 @@ def cmd_detect(args, engine, info, rules):
         print(f"    python {os.path.basename(__file__)} golden           # golden-file regression gate")
 
 
+def cmd_validate(args):
+    """Default path: all deterministic gates + advisory reports. Air-gapped.
+
+    The CLI inversion (TODO.md) — validation is what `drop.py` does with no
+    command; generation (develop/test/review) is opt-in. Needs no Ollama.
+    """
+    from validate import run_validate, print_validate
+    log("=" * 60)
+    log("  DROP — Validate (gates + findings)")
+    log("=" * 60)
+    root = os.path.abspath(args.project)
+    result = run_validate(
+        root,
+        layers_config=getattr(args, "layers_config", None),
+        invariants_config=getattr(args, "invariants_config", None),
+        golden_config=getattr(args, "golden_config", None),
+    )
+    print_validate(result)
+    sys.exit(0 if result["ok"] else 1)
+
+
 def cmd_golden(args):
     """Golden-file regression gate. Deterministic, local — no Ollama, no rules."""
     from golden import run_golden, print_golden
@@ -254,6 +276,43 @@ def cmd_golden(args):
     result = run_golden(root, config_path=getattr(args, "golden_config", None),
                         update=getattr(args, "update", False))
     print_golden(result)
+    sys.exit(0 if result["ok"] else 1)
+
+
+def cmd_layers(args):
+    """Architectural layer gate. Deterministic, local — no Ollama, no rules."""
+    from layers import run_layers, print_layers
+    log("=" * 60)
+    log("  DROP — Architectural Layer Gate")
+    log("=" * 60)
+    root = os.path.abspath(args.project)
+    result = run_layers(root, config_path=getattr(args, "layers_config", None))
+    print_layers(result)
+    sys.exit(0 if result["ok"] else 1)
+
+
+def cmd_invariants(args):
+    """Design-invariant harness. Deterministic, local — no Ollama, no rules."""
+    from invariants import run_invariants, print_invariants
+    log("=" * 60)
+    log("  DROP — Design-Invariant Harness")
+    log("=" * 60)
+    root = os.path.abspath(args.project)
+    result = run_invariants(root, config_path=getattr(args, "invariants_config", None))
+    print_invariants(result)
+    sys.exit(0 if result["ok"] else 1)
+
+
+def cmd_hooks(args):
+    """Install local gate triggers (pre-commit hook + optional CI). Air-gapped."""
+    from triggers import run_hooks, print_hooks
+    log("=" * 60)
+    log("  DROP — Install Local Gate Triggers")
+    log("=" * 60)
+    root = os.path.abspath(args.project)
+    result = run_hooks(root, python=sys.executable, drop=os.path.abspath(__file__),
+                       ci=getattr(args, "ci", False), force=getattr(args, "force", False))
+    print_hooks(result)
     sys.exit(0 if result["ok"] else 1)
 
 
@@ -543,11 +602,20 @@ def main():
                              "[golden] re-bank snapshots (accept current output as golden)")
     parser.add_argument("--golden-config", type=str,
                         help="[golden] path to golden config (default: <project>/.golden.json)")
+    parser.add_argument("--layers-config", type=str,
+                        help="[layers] path to layers config (default: <project>/.layers.json)")
+    parser.add_argument("--invariants-config", type=str,
+                        help="[invariants] path to check module (default: <project>/.invariants.py)")
+    parser.add_argument("--ci", action="store_true",
+                        help="[hooks] also write a .github/workflows CI snippet")
+    parser.add_argument("--force", action="store_true",
+                        help="[hooks] overwrite an existing hook/workflow (backs up a foreign hook)")
 
-    parser.add_argument("command", nargs="?", default="detect",
-                        choices=["detect", "develop", "test", "review", "fix", "all", "full",
-                                 "setup", "install", "golden"],
-                        help="What to do (default: detect)")
+    parser.add_argument("command", nargs="?", default="validate",
+                        choices=["validate", "detect", "develop", "test", "review", "fix",
+                                 "all", "full", "setup", "install", "golden", "layers",
+                                 "invariants", "hooks"],
+                        help="What to do (default: validate — run the gates + advisory reports)")
 
     args = parser.parse_args()
 
@@ -574,10 +642,23 @@ def main():
         _cat_mod.CATALOG_URL = cfg["catalog_url"]
 
     # ── Air-gapped gates: run before touching Ollama ──
-    # The golden-file runner is deterministic and local (sovereignty constraint) —
-    # it must work with no Ollama reachable, so it dispatches before engine setup.
+    # Validation (the default), the golden-file runner, layer gate, and invariant
+    # harness are deterministic and local (sovereignty constraint) — they must
+    # work with no Ollama reachable, so they dispatch before engine setup.
+    if args.command == "validate":
+        cmd_validate(args)
+        return
     if args.command == "golden":
         cmd_golden(args)
+        return
+    if args.command == "layers":
+        cmd_layers(args)
+        return
+    if args.command == "invariants":
+        cmd_invariants(args)
+        return
+    if args.command == "hooks":
+        cmd_hooks(args)
         return
 
     # ── Setup engine ──

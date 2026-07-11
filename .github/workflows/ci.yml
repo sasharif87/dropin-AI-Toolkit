@@ -1,0 +1,25 @@
+# dropin-AI-Toolkit — own house CI. The toolkit that refuses to apply unverified
+# fixes to other repos runs its own gate on every push/PR: the full stdlib
+# unittest suite (no pytest, no Ollama — matches the air-gapped sovereignty
+# constraint), then the three fail-closed gates pointed at the toolkit itself.
+# The toolkit hasn't configured .layers.json / .invariants.py / .golden.json, so
+# those steps opt out cleanly (exit 0) — proving the wiring runs end-to-end
+# without inventing a false failure.
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Toolkit test suite
+        run: python -m unittest discover -s tests -v
+      - name: Layer gate (self)
+        run: python drop.py layers --project .
+      - name: Invariant harness (self)
+        run: python drop.py invariants --project .
+      - name: Golden-file gate (self)
+        run: python drop.py golden --project .

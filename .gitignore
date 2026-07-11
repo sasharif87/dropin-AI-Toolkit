@@ -36,3 +36,6 @@ Thumbs.db
 
 # Toolkit-local runtime artifacts (host-specific; regenerated on demand)
 .dropin_catalog.json
+
+# Reference-only IME source staged for the gate-extraction port (not toolkit code)
+_ime_ref/

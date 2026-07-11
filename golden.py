@@ -264,9 +264,15 @@ def run_golden(root, config_path=None, update=False):
     Returns a dict: ``config`` (path or None), ``cases`` (per-case results),
     ``counts`` (status tally), and ``ok`` (True when the gate passes). In check
     mode ``ok`` is True only with no regression / new / error; in update mode
-    regressions and new cases are banked, so ``ok`` reflects only errors.
+    regressions and new cases are banked, so ``ok`` reflects only errors. An
+    explicitly passed *config_path* that doesn't exist fails (only
+    auto-discovery finding nothing is an opt-out; a typo'd path must never go
+    silently green).
     """
     root = os.path.abspath(root)
+    if config_path and not os.path.isfile(config_path):
+        return {"config": config_path, "cases": [], "counts": {}, "ok": False,
+                "note": f"golden config not found: {config_path}"}
     path = find_config(root, config_path)
     result = {"config": path, "cases": [], "counts": {}, "ok": True}
     if not path:
