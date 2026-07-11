@@ -22,7 +22,8 @@ import textwrap
 import unittest
 from contextlib import redirect_stdout
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path[:0] = [_ROOT, os.path.join(_ROOT, "gates"), os.path.join(_ROOT, "generation")]
 
 from validate import run_validate, print_validate
 from golden import run_golden

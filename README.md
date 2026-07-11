@@ -28,6 +28,26 @@ or you typed it.
 | Writes files? | No (read-only reports) | Only with `--apply` |
 | What it does | Runs the gate pack + advisory reports, returns one pass/fail verdict | Scaffolds code, generates tests, reviews, applies fixes |
 
+## Layout
+
+The file tree mirrors the two halves — the driver at the root, each half in
+its own directory:
+
+```text
+drop.py         the driver — one CLI for both halves
+gates/          validation half: layers, invariants, golden + the advisory
+                reports (orphans, claims, findings). Stdlib-only, air-gapped.
+generation/     generation half: the Ollama engine and everything that uses
+                it (detect, develop, testgen, review, fix, wiring, ...).
+mcp_server.py   MCP entry point exposing the pipeline to a frontier model
+codex.py        standalone TODO-to-code runner (stdlib, local Ollama)
+tests/          stdlib-unittest suite covering both halves
+```
+
+Modules keep flat names (`from invariants import ...` still works — `drop.py`
+puts both directories on `sys.path`), so a consuming repo's `.invariants.py`
+and any vendored copy behave exactly as before.
+
 ## Quick start
 
 ```bash

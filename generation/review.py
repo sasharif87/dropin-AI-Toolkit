@@ -25,6 +25,14 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 
+# Standalone-runnable: put both toolkit dirs on the path (findings lives in
+# gates/, siblings here in generation/) so flat imports resolve either way.
+_TOOLKIT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.join(_TOOLKIT_ROOT, "gates"),
+           os.path.join(_TOOLKIT_ROOT, "generation")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from engine import Engine, extract_json, read_file, chunk_text, fmt_time, log
 import config
 import findings as fnd

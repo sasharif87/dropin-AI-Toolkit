@@ -42,10 +42,16 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# Ensure the script directory is on the path so imports work
+# Ensure the toolkit dirs are on the path so flat imports work everywhere:
+# gates/ holds the air-gapped validation half, generation/ the Ollama half.
+# Modules import each other by bare name (`from engine import ...`) so a
+# consuming repo's .invariants.py can keep `from invariants import ...`.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
+for _p in (SCRIPT_DIR,
+           os.path.join(SCRIPT_DIR, "gates"),
+           os.path.join(SCRIPT_DIR, "generation")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from engine import Engine, fmt_time, log, timed_input
 from detect import detect, print_detection
@@ -372,7 +378,7 @@ def cmd_review(args, engine, info, rules):
 def cmd_fix(args, engine, info, rules):
     """Apply review fixes."""
     # Delegate to fix.py with forwarded args
-    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "fix.py")]
+    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generation", "fix.py")]
     if args.apply: cmd.append("--apply")
     if getattr(args, "yes", False): cmd.append("--yes")
     if getattr(args, "batch", False): cmd.append("--batch")
@@ -447,7 +453,7 @@ def cmd_all(args, engine, info, rules):
         log("\n" + "=" * 60)
         log("  PHASE 5 — Apply Fixes")
         log("=" * 60)
-        fix_cmd = [sys.executable, os.path.join(SCRIPT_DIR, "fix.py"),
+        fix_cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generation", "fix.py"),
                    "--apply", "--ollama-url", args.url,
                    "--code-url", getattr(args, "code_url", args.url), info["root"]]
         if args.layer: fix_cmd.extend(["--layer", args.layer])

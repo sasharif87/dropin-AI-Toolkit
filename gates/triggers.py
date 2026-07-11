@@ -91,7 +91,7 @@ _CI_TEMPLATE = """\
 # ONE strategy below and delete the other:
 #   (A) check the toolkit out alongside this repo — set `repository:` to your
 #       toolkit's slug (shown), or
-#   (B) vendor layers.py / invariants.py / golden.py / drop.py into this repo and
+#   (B) vendor the toolkit (drop.py + gates/ + generation/) into this repo and
 #       point DROPIN_HOME at that folder (drop the extra checkout step).
 name: dropin-gates
 on: [push, pull_request]

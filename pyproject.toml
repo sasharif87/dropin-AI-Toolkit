@@ -1,0 +1,9 @@
+# IDE/type-checker config only — the toolkit itself is plain scripts, no
+# packaging. gates/ and generation/ are import roots (drop.py puts them on
+# sys.path at runtime so modules keep flat names like `from engine import ...`
+# and a consuming repo's .invariants.py can `from invariants import ...`).
+[tool.pyright]
+extraPaths = ["gates", "generation"]
+
+[tool.ty.environment]
+extra-paths = ["gates", "generation"]
